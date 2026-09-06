@@ -1,0 +1,133 @@
+# Provenance-aware marine dynamics contract for the current visual/physics vehicle.
+# The visual asset contains four horizontal and four vertical thrusters. This is
+# an 8-thruster Heavy-like configuration, not standard 6-thruster BlueROV2 truth.
+vehicle_version: bluerov2_heavy_like_8_thruster
+visual_source: "bvibhav/stonefish_bluerov2@6448383af6b7ef6083b0eac2c08102660591e318"
+coordinate_frame: "body x-forward, y-left, z-up; wxyz quaternions"
+presets:
+  fast_rl:
+    added_mass_mode: none
+    added_mass_coriolis: false
+    notes: "Buoyancy, restoring, relative-current damping, thrusters, and lag; no added-mass coupling."
+  hydro_rl:
+    added_mass_mode: diagonal
+    added_mass_coriolis: true
+    notes: "Diagonal added mass is an explicit approximation and is NOT YET VALIDATED for this vehicle."
+  reference:
+    added_mass_mode: full_matrix
+    added_mass_coriolis: true
+    notes: "Full-matrix interface and diagnostics; values remain unvalidated until replay/calibration."
+
+mass:
+  nominal: 20.0
+  lower: 18.0
+  upper: 22.0
+  unit: kg
+  source_type: estimated
+  source: "Project primitive rigid-body contract (configs/robot.yaml)"
+  confidence: low
+  notes: "Project approximation; verify with weighed vehicle and payload configuration."
+inertia:
+  nominal: [0.5666667, 1.2166667, 1.4833333]
+  lower: [0.45, 0.95, 1.15]
+  upper: [0.75, 1.55, 1.90]
+  unit: kg m^2
+  source_type: geometry-derived
+  source: "Uniform cuboid approximation from the lightweight collision geometry"
+  confidence: low
+  notes: "Detailed visual mesh and real payload inertia are not represented; NOT YET VALIDATED."
+volume:
+  nominal: 0.0197073171
+  lower: 0.0185
+  upper: 0.0210
+  unit: m^3
+  source_type: estimated
+  source: "Project hydrostatic nominal"
+  confidence: low
+  notes: "Displaced volume and ballast state require real measurement."
+center_of_mass:
+  nominal: [0.0, 0.0, 0.0]
+  lower: [-0.03, -0.03, -0.03]
+  upper: [0.03, 0.03, 0.03]
+  unit: m
+  source_type: estimated
+  source: "Project rigid-body origin convention"
+  confidence: low
+  notes: "PhysX body origin is treated as CoM for the primitive body."
+center_of_buoyancy:
+  nominal: [0.0, 0.0, 0.04]
+  lower: [-0.02, -0.02, 0.01]
+  upper: [0.02, 0.02, 0.08]
+  unit: m
+  source_type: estimated
+  source: "Project hydrostatic nominal"
+  confidence: low
+  notes: "CoB offset is not a measurement of the assembled vehicle."
+water:
+  density:
+    nominal: 1025.0
+    lower: 1020.0
+    upper: 1030.0
+    unit: kg m^-3
+    source_type: published
+    source: "Standard seawater nominal used by Fossen-style models"
+    confidence: medium
+  gravity:
+    nominal: 9.81
+    lower: 9.80
+    upper: 9.82
+    unit: m s^-2
+    source_type: published
+    source: "SI standard local approximation"
+    confidence: high
+linear_damping:
+  surge: {nominal: 12.0, lower: 4.0, upper: 30.0, unit: N s m^-1, source_type: estimated, source: "Project nominal", confidence: low}
+  sway: {nominal: 20.0, lower: 6.0, upper: 45.0, unit: N s m^-1, source_type: estimated, source: "Project nominal", confidence: low}
+  heave: {nominal: 25.0, lower: 8.0, upper: 55.0, unit: N s m^-1, source_type: estimated, source: "Project nominal", confidence: low}
+  roll: {nominal: 1.5, lower: 0.2, upper: 5.0, unit: N m s rad^-1, source_type: estimated, source: "Project nominal", confidence: low}
+  pitch: {nominal: 1.5, lower: 0.2, upper: 5.0, unit: N m s rad^-1, source_type: estimated, source: "Project nominal", confidence: low}
+  yaw: {nominal: 2.0, lower: 0.3, upper: 8.0, unit: N m s rad^-1, source_type: estimated, source: "Project nominal", confidence: low}
+quadratic_damping:
+  surge: {nominal: 18.0, lower: 5.0, upper: 60.0, unit: N s^2 m^-2, source_type: estimated, source: "Project nominal", confidence: low}
+  sway: {nominal: 28.0, lower: 8.0, upper: 80.0, unit: N s^2 m^-2, source_type: estimated, source: "Project nominal", confidence: low}
+  heave: {nominal: 35.0, lower: 10.0, upper: 100.0, unit: N s^2 m^-2, source_type: estimated, source: "Project nominal", confidence: low}
+  roll: {nominal: 2.0, lower: 0.3, upper: 8.0, unit: N m s^2 rad^-2, source_type: estimated, source: "Project nominal", confidence: low}
+  pitch: {nominal: 2.0, lower: 0.3, upper: 8.0, unit: N m s^2 rad^-2, source_type: estimated, source: "Project nominal", confidence: low}
+  yaw: {nominal: 3.0, lower: 0.5, upper: 12.0, unit: N m s^2 rad^-2, source_type: estimated, source: "Project nominal", confidence: low}
+added_mass:
+  translational:
+    nominal: [2.0, 3.0, 4.0]
+    lower: [0.0, 0.0, 0.0]
+    upper: [8.0, 12.0, 16.0]
+    unit: kg
+    source_type: estimated
+    source: "Conservative project approximation; no BlueROV2 matrix measurement yet"
+    confidence: low
+  rotational:
+    nominal: [0.05, 0.08, 0.12]
+    lower: [0.0, 0.0, 0.0]
+    upper: [0.30, 0.40, 0.60]
+    unit: kg m^2
+    source_type: estimated
+    source: "Conservative project approximation; no BlueROV2 matrix measurement yet"
+    confidence: low
+  full_matrix_nominal: null
+  notes: "All added-mass values are NOT YET VALIDATED and must not be called ground truth."
+thrusters:
+  count: 8
+  configuration: "4 horizontal diagonal + 4 vertical; Heavy-like"
+  max_forward_thrust_n: {nominal: 40.0, lower: 30.0, upper: 50.0, source_type: estimated, source: "Project actuator contract", confidence: low}
+  max_reverse_thrust_n: {nominal: 30.0, lower: 20.0, upper: 40.0, source_type: estimated, source: "Project actuator contract", confidence: low}
+  response_time_s: {nominal: 0.08, lower: 0.03, upper: 0.20, source_type: estimated, source: "Project actuator contract", confidence: low}
+  curve: {type: polynomial, exponent_nominal: 2.0, dead_zone_nominal: 0.05}
+  notes: "Thrust curves and lag require PWM/current-log calibration."
+experimental_references:
+  heave_bluerov2_heavy:
+    citation: "Espinal, Cerrada, Chaos, Moreno-Salinas (2026), Jornadas de Automatica 47"
+    doi: "10.17979/ja-cea.2026.47.13848"
+    vehicle: "BlueROV2 Heavy, 8 thrusters"
+    evidence: "Experimental PRBS and step-response identification in Stabilize mode"
+    fitted_heave_drag_alpha_inv_m: 2.81
+    fitted_heave_controller_kp_inv_s: 0.55
+    fitted_heave_controller_ki_inv_s2: 0.40
+    validation_status: "single-axis reference only; not used as 6-DoF ground truth"
