@@ -1,0 +1,248 @@
+#usda 1.0
+(
+    customLayerData = {
+        string license = "Apache-2.0"
+        string source = "https://github.com/bvibhav/stonefish_bluerov2"
+        string sourceCommit = "6448383af6b7ef6083b0eac2c08102660591e318"
+    }
+    defaultPrim = "BlueROV2Visual"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "BlueROV2Visual" (
+    kind = "component"
+)
+{
+    def "Looks"
+    {
+        def Material "Hull"
+        {
+            token inputs:frame:stPrimvarName = "st"
+            token outputs:surface.connect = </BlueROV2Visual/Looks/Hull/Shader.outputs:surface>
+
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </BlueROV2Visual/Looks/Hull/DiffuseTexture.outputs:rgb>
+                float inputs:metallic = 0
+                float inputs:roughness = 0.45
+                token outputs:surface
+            }
+
+            def Shader "StReader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                token inputs:varname.connect = </BlueROV2Visual/Looks/Hull.inputs:frame:stPrimvarName>
+                float2 outputs:result
+            }
+
+            def Shader "DiffuseTexture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @source/br2.png@
+                token inputs:sourceColorSpace = "sRGB"
+                float2 inputs:st.connect = </BlueROV2Visual/Looks/Hull/StReader.outputs:result>
+                float3 outputs:rgb
+            }
+        }
+
+        def Material "Frame"
+        {
+            token outputs:surface.connect = </BlueROV2Visual/Looks/Frame/Shader.outputs:surface>
+
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.025, 0.035, 0.045)
+                float inputs:metallic = 0.15
+                float inputs:roughness = 0.32
+                token outputs:surface
+            }
+        }
+
+        def Material "Propeller"
+        {
+            token outputs:surface.connect = </BlueROV2Visual/Looks/Propeller/Shader.outputs:surface>
+
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0, 0.42, 0.68)
+                float inputs:metallic = 0
+                float inputs:roughness = 0.4
+                token outputs:surface
+            }
+        }
+    }
+
+    def Xform "Hull" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Hull>
+        float3 xformOp:rotateXYZ = (0, 0, 0)
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/hull/hull.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "HeavyFrame" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Frame>
+        float3 xformOp:rotateXYZ = (0, 0, 0)
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/wings/wings.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "FrontRight" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, 0, -45)
+        double3 xformOp:translate = (0.1355, 0.1, 0.0725)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/ccw/ccw.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "FrontLeft" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, 0, 45)
+        double3 xformOp:translate = (0.1355, -0.1, 0.0725)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/ccw/ccw.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "BackRight" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, 0, -135)
+        double3 xformOp:translate = (-0.1475, 0.1, 0.0725)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/cw/cw.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "BackLeft" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, 0, 135)
+        double3 xformOp:translate = (-0.1475, -0.1, 0.0725)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/cw/cw.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "DiveFrontRight" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, -90, 0)
+        double3 xformOp:translate = (0.12, 0.218, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/cw/cw.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "DiveFrontLeft" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, -90, 0)
+        double3 xformOp:translate = (0.12, -0.218, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/ccw/ccw.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "DiveBackRight" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, -90, 0)
+        double3 xformOp:translate = (-0.12, 0.218, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/ccw/ccw.usd@
+        )
+        {
+        }
+    }
+
+    def Xform "DiveBackLeft" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </BlueROV2Visual/Looks/Propeller>
+        float3 xformOp:rotateXYZ = (0, -90, 0)
+        double3 xformOp:translate = (-0.12, -0.218, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+        def Xform "Asset" (
+            instanceable = true
+            prepend references = @usd/cw/cw.usd@
+        )
+        {
+        }
+    }
+}
