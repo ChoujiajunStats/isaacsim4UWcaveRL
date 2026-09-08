@@ -8,6 +8,7 @@ from typing import Protocol
 class OpenWaterWorldCfg:
     size_m: tuple[float, float, float] = (20.0, 20.0, 8.0)
     seabed_depth_m: float = 8.0
+    seabed_enabled: bool = True
     asset_path: str | None = None
     collision_asset_path: str | None = None
     asset_scale: float = 1.0
@@ -46,18 +47,58 @@ def spawn_open_water_world(
 
     prims: list[object] = []
     floor_path = seabed_path or f"{root_path}/seabed"
-    prims.append(
-        spawn_ground_plane(
-            prim_path=floor_path,
-            cfg=GroundPlaneCfg(
-                physics_material=sim_utils.RigidBodyMaterialCfg(
-                    static_friction=0.8,
-                    dynamic_friction=0.6,
-                    restitution=0.0,
+    if cfg.seabed_enabled:
+        prims.append(
+            spawn_ground_plane(
+                prim_path=floor_path,
+                cfg=GroundPlaneCfg(
+                    physics_material=sim_utils.RigidBodyMaterialCfg(
+                        static_friction=0.8,
+                        dynamic_friction=0.6,
+                        restitution=0.0,
+                    )
                 )
-            ),
+            )
         )
+    prims.extend(spawn_world_assets(cfg, root_path=root_path))
+
+    marker_cfg = sim_utils.CuboidCfg(
+        size=(0.25, 0.25, 0.25),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.65, 0.08)),
     )
+    if cfg.landmarks_enabled:
+        for index, position in enumerate(cfg.landmark_positions_m):
+            prims.append(
+                marker_cfg.func(
+                    f"{root_path}/Landmarks/Marker_{index:03d}",
+                    marker_cfg,
+                    translation=position,
+                )
+            )
+
+    if cfg.obstacles_enabled:
+        obstacle_cfg = sim_utils.CuboidCfg(
+            size=cfg.obstacle_size_m,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.18, 0.22, 0.24)),
+        )
+        for index, position in enumerate(cfg.obstacle_positions_m):
+            prims.append(
+                obstacle_cfg.func(
+                    f"{root_path}/Obstacles/Obstacle_{index:03d}",
+                    obstacle_cfg,
+                    translation=position,
+                )
+            )
+    return prims
+
+
+def spawn_world_assets(cfg: OpenWaterWorldCfg, *, root_path: str) -> list[object]:
+    """Spawn only visual/collision assets, allowing heterogeneous env roots."""
+    from isaaclab import sim as sim_utils
+
+    prims: list[object] = []
     if cfg.asset_path and cfg.visual_enabled:
         asset_cfg = sim_utils.UsdFileCfg(
             usd_path=cfg.asset_path,
@@ -85,21 +126,4 @@ def spawn_open_water_world(
             )
         )
 
-    marker_cfg = sim_utils.CuboidCfg(
-        size=(0.25, 0.25, 0.25),
-        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.65, 0.08)),
-    )
-    if cfg.landmarks_enabled:
-        for index, position in enumerate(cfg.landmark_positions_m):
-            prims.append(marker_cfg.func(f"{root_path}/Landmarks/Marker_{index:03d}", marker_cfg, translation=position))
-
-    if cfg.obstacles_enabled:
-        obstacle_cfg = sim_utils.CuboidCfg(
-            size=cfg.obstacle_size_m,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.18, 0.22, 0.24)),
-        )
-        for index, position in enumerate(cfg.obstacle_positions_m):
-            prims.append(obstacle_cfg.func(f"{root_path}/Obstacles/Obstacle_{index:03d}", obstacle_cfg, translation=position))
     return prims

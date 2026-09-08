@@ -108,3 +108,29 @@ class UnderwaterCaveEntryPPORunnerCfg(UnderwaterExplorePPORunnerCfg):
     """Separate log namespace for the geometry-inferred entry curriculum."""
 
     experiment_name = "underwater_cave_entry"
+
+
+@configclass
+class UnderwaterMultiCaveNavigationPPORunnerCfg(UnderwaterExplorePPORunnerCfg):
+    """Long-horizon recurrent PPO shared by all selected cave scenes."""
+
+    num_steps_per_env = 64
+    max_iterations = 2000
+    save_interval = 50
+    experiment_name = "underwater_cave_multinav"
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.005,
+        num_learning_epochs=5,
+        # train_all defaults to six envs (two per cave), so three recurrent
+        # mini-batches preserve scene balance inside each update.
+        num_mini_batches=3,
+        learning_rate=3.0e-4,
+        schedule="adaptive",
+        gamma=0.995,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )

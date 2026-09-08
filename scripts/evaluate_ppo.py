@@ -21,8 +21,20 @@ parser.add_argument("--task", type=str, default="Isaac-Underwater-PointNav-Direc
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--episodes", type=int, default=32)
+parser.add_argument(
+    "--episodes_per_scene",
+    type=int,
+    default=None,
+    help="For multi-cave tasks, collect this many episodes from every selected scene.",
+)
 parser.add_argument("--max_rollout_steps", type=int, default=20000)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument(
+    "--episode_length_s",
+    type=float,
+    default=None,
+    help="Optional finite-evaluation horizon override; omit for the task horizon.",
+)
 parser.add_argument("--output", type=Path, default=None, help="Optional JSON metrics output path.")
 parser.add_argument(
     "--current_mode",
@@ -30,12 +42,24 @@ parser.add_argument(
     default=None,
 )
 parser.add_argument("--domain_randomization", action="store_true")
+parser.add_argument(
+    "--cave_dataset_profile",
+    default=None,
+    help="Override the multi-cave manifest profile before task registration.",
+)
 parser.add_argument("--hydrodynamics_preset", choices=("fast_rl", "hydro_rl", "reference"), default=None)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
+if args.cave_dataset_profile:
+    import os
+
+    os.environ["ISAAC_UNDERWATER_CAVE_PROFILE"] = args.cave_dataset_profile
 # Visual actor checkpoints require tiled camera buffers during evaluation.
-if "VisualPilot" in args.task or "Cave-Explore" in args.task or "Cave-Entry" in args.task:
+if any(
+    marker in args.task
+    for marker in ("VisualPilot", "Cave-Explore", "Cave-Entry", "Cave-Navigation")
+):
     args.enable_cameras = True
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
@@ -58,17 +82,23 @@ def _write_metrics(path: Path, metrics: dict[str, object]) -> None:
 
 
 def main() -> None:
-    if args.episodes <= 0:
+    if args.episodes_per_scene is None and args.episodes <= 0:
         raise ValueError("--episodes must be positive")
+    if args.episodes_per_scene is not None and args.episodes_per_scene <= 0:
+        raise ValueError("--episodes_per_scene must be positive")
     if args.num_envs <= 0:
         raise ValueError("--num_envs must be positive")
     if args.max_rollout_steps <= 0:
         raise ValueError("--max_rollout_steps must be positive")
+    if args.episode_length_s is not None and args.episode_length_s <= 0.0:
+        raise ValueError("--episode_length_s must be positive")
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
 
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
     env_cfg.seed = args.seed
+    if args.episode_length_s is not None:
+        env_cfg.episode_length_s = args.episode_length_s
     if args.current_mode is not None:
         env_cfg.current_mode = args.current_mode
         if args.current_mode in {"slow_varying", "sinusoidal", "random_walk"}:
@@ -78,6 +108,15 @@ def main() -> None:
         env_cfg.domain_randomization_enabled = True
     if args.hydrodynamics_preset is not None:
         env_cfg.hydrodynamics_preset = args.hydrodynamics_preset
+    variants = tuple(getattr(env_cfg.world, "scene_variants", ()))
+    if args.episodes_per_scene is not None and not variants:
+        raise ValueError("--episodes_per_scene requires a multi-cave task profile")
+    required_episodes = (
+        args.episodes_per_scene * len(variants)
+        if args.episodes_per_scene is not None
+        else args.episodes
+    )
+    scene_episode_counts = {scene_id: 0 for scene_id in range(len(variants))}
 
     print(f"ppo_eval: building {args.task} with {args.num_envs} environments", flush=True)
     env = gym.make(args.task, cfg=env_cfg)
@@ -103,6 +142,9 @@ def main() -> None:
     completed_workspace_coverage: list[float] = []
     completed_unique_voxels: list[int] = []
     completed_path_lengths: list[float] = []
+    completed_reference_paths: list[float] = []
+    completed_spl: list[float] = []
+    completed_scene_ids: list[int] = []
 
     obs = vec_env.get_observations()
     for rollout_step in range(1, args.max_rollout_steps + 1):
@@ -133,33 +175,62 @@ def main() -> None:
         coverage_buffer = extras.get("episode_workspace_coverage")
         unique_voxels_buffer = extras.get("episode_unique_voxels")
         path_length_buffer = extras.get("episode_path_length_m")
-        if coverage_buffer is None or unique_voxels_buffer is None or path_length_buffer is None:
-            raise RuntimeError("Task did not expose episode exploration metric extras")
+        reference_path_buffer = extras.get("episode_reference_path_m")
+        spl_buffer = extras.get("episode_spl")
+        scene_id_buffer = extras.get("episode_scene_id")
+        if any(
+            value is None
+            for value in (
+                coverage_buffer,
+                unique_voxels_buffer,
+                path_length_buffer,
+                reference_path_buffer,
+                spl_buffer,
+                scene_id_buffer,
+            )
+        ):
+            raise RuntimeError("Task did not expose complete episode metric extras")
         coverages = coverage_buffer[done_ids].detach().cpu().tolist()
         unique_voxels = unique_voxels_buffer[done_ids].detach().cpu().tolist()
         path_lengths = path_length_buffer[done_ids].detach().cpu().tolist()
+        reference_paths = reference_path_buffer[done_ids].detach().cpu().tolist()
+        spl_values = spl_buffer[done_ids].detach().cpu().tolist()
+        scene_ids = scene_id_buffer[done_ids].detach().cpu().tolist()
         returns = episode_returns[done_ids].detach().cpu().tolist()
         lengths = episode_lengths[done_ids].detach().cpu().tolist()
-        remaining = args.episodes - len(completed_returns)
-        completed_returns.extend(float(value) for value in returns[:remaining])
-        completed_lengths.extend(int(value) for value in lengths[:remaining])
-        completed_success.extend(bool(value) for value in success[:remaining])
-        completed_bounds.extend(bool(value) for value in bounds[:remaining])
-        completed_timeouts.extend(bool(value) for value in timeouts[:remaining])
-        completed_collisions.extend(bool(value) for value in collisions[:remaining])
-        completed_workspace_coverage.extend(float(value) for value in coverages[:remaining])
-        completed_unique_voxels.extend(int(value) for value in unique_voxels[:remaining])
-        completed_path_lengths.extend(float(value) for value in path_lengths[:remaining])
+        for index in range(len(returns)):
+            scene_id = int(scene_ids[index])
+            if args.episodes_per_scene is not None:
+                if scene_id not in scene_episode_counts:
+                    raise RuntimeError(f"Task reported invalid cave scene id {scene_id}")
+                if scene_episode_counts[scene_id] >= args.episodes_per_scene:
+                    continue
+            elif len(completed_returns) >= required_episodes:
+                break
+            completed_returns.append(float(returns[index]))
+            completed_lengths.append(int(lengths[index]))
+            completed_success.append(bool(success[index]))
+            completed_bounds.append(bool(bounds[index]))
+            completed_timeouts.append(bool(timeouts[index]))
+            completed_collisions.append(bool(collisions[index]))
+            completed_workspace_coverage.append(float(coverages[index]))
+            completed_unique_voxels.append(int(unique_voxels[index]))
+            completed_path_lengths.append(float(path_lengths[index]))
+            completed_reference_paths.append(float(reference_paths[index]))
+            completed_spl.append(float(spl_values[index]))
+            completed_scene_ids.append(scene_id)
+            if args.episodes_per_scene is not None:
+                scene_episode_counts[scene_id] += 1
         episode_returns[done_ids] = 0.0
         episode_lengths[done_ids] = 0
         if hasattr(policy, "reset"):
             policy.reset(dones)
-        if len(completed_returns) >= args.episodes:
+        if len(completed_returns) >= required_episodes:
             break
 
-    if len(completed_returns) < args.episodes:
+    if len(completed_returns) < required_episodes:
         raise RuntimeError(
-            f"Only completed {len(completed_returns)} / {args.episodes} episodes "
+            f"Only completed {len(completed_returns)} / {required_episodes} episodes "
             f"within {args.max_rollout_steps} rollout steps"
         )
 
@@ -169,8 +240,10 @@ def main() -> None:
         "checkpoint": str(args.checkpoint.resolve()),
         "num_envs": args.num_envs,
         "episodes": count,
+        "episodes_per_scene": args.episodes_per_scene,
         "rollout_steps": rollout_step,
         "seed": args.seed,
+        "episode_length_s": float(env_cfg.episode_length_s),
         "hydrodynamics_preset": getattr(env_cfg, "hydrodynamics_preset", None),
         "domain_randomization": bool(getattr(env_cfg, "domain_randomization_enabled", False)),
         "current_mode": getattr(env_cfg, "current_mode", None),
@@ -180,6 +253,10 @@ def main() -> None:
         "out_of_bounds_rate": sum(completed_bounds) / count,
         "timeout_rate": sum(completed_timeouts) / count,
         "collision_rate": sum(completed_collisions) / count,
+        "mean_path_length_m": sum(completed_path_lengths) / count,
+        "mean_reference_path_length_m": sum(completed_reference_paths) / count,
+        "mean_spl": sum(completed_spl) / count,
+        "spl_reference": "provided_collision_checked_A_star_route_not_exact_continuous_geodesic",
         "min_return": min(completed_returns),
         "max_return": max(completed_returns),
     }
@@ -188,8 +265,42 @@ def main() -> None:
             {
                 "mean_workspace_coverage_fraction": sum(completed_workspace_coverage) / count,
                 "mean_unique_voxels": sum(completed_unique_voxels) / count,
-                "mean_path_length_m": sum(completed_path_lengths) / count,
                 "coverage_denominator": "bounded_workspace_voxels_not_inferred_free_space",
+            }
+        )
+    if variants:
+        per_scene: dict[str, object] = {}
+        per_difficulty_samples: dict[str, list[int]] = {}
+        for scene_id, scene in enumerate(variants):
+            sample_ids = [index for index, value in enumerate(completed_scene_ids) if value == scene_id]
+            if not sample_ids:
+                continue
+            per_difficulty_samples.setdefault(scene.difficulty, []).extend(sample_ids)
+            scene_count = len(sample_ids)
+            per_scene[scene.key] = {
+                "difficulty": scene.difficulty,
+                "episodes": scene_count,
+                "success_rate": sum(completed_success[index] for index in sample_ids) / scene_count,
+                "collision_rate": sum(completed_collisions[index] for index in sample_ids) / scene_count,
+                "mean_spl": sum(completed_spl[index] for index in sample_ids) / scene_count,
+                "mean_path_length_m": sum(completed_path_lengths[index] for index in sample_ids) / scene_count,
+            }
+        per_difficulty = {}
+        for difficulty, sample_ids in per_difficulty_samples.items():
+            difficulty_count = len(sample_ids)
+            per_difficulty[difficulty] = {
+                "episodes": difficulty_count,
+                "success_rate": sum(completed_success[index] for index in sample_ids) / difficulty_count,
+                "collision_rate": sum(completed_collisions[index] for index in sample_ids) / difficulty_count,
+                "mean_spl": sum(completed_spl[index] for index in sample_ids) / difficulty_count,
+            }
+        metrics.update(
+            {
+                "cave_dataset": getattr(env_cfg.world, "dataset_name", None),
+                "cave_dataset_profile": getattr(env_cfg.world, "dataset_profile", None),
+                "scene_assignment": "static_balanced_round_robin",
+                "per_scene": per_scene,
+                "per_difficulty": per_difficulty,
             }
         )
     if bool(getattr(env_cfg, "cave_entry_enabled", False)):

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import math
 from collections.abc import Sequence
 from pathlib import Path
@@ -41,15 +40,24 @@ from isaac_underwater.navigation import (
     CavePortal,
     PolicyStateSource,
     VoxelVisitTracker,
+    balanced_scene_assignment,
     build_navigation_observation,
     build_visual_observation,
     infer_clearance_portals,
     interpolate_polyline,
+    load_cave_route,
     navigation_observation_to_tensor,
     robust_forward_clearance,
     visual_feature_dim,
 )
-from isaac_underwater.physics import CurrentField, CurrentProfileCfg, Hydrodynamics, HydrodynamicsCfg, rotate_world_to_body
+from isaac_underwater.physics import (
+    CurrentField,
+    CurrentProfileCfg,
+    Hydrodynamics,
+    HydrodynamicsCfg,
+    rotate_body_to_world,
+    rotate_world_to_body,
+)
 from isaac_underwater.randomization import (
     domain_gap_from_mapping,
     perturb_thruster_command,
@@ -58,7 +66,15 @@ from isaac_underwater.randomization import (
 )
 from isaac_underwater.robot import make_underwater_robot_cfg, spawn_bluerov2_visual
 from isaac_underwater.sensors import SensorSuiteCfg
-from isaac_underwater.worlds import CaveWorldCfg, OpenWaterWorldCfg, load_cave_world_cfg, spawn_open_water_world
+from isaac_underwater.worlds import (
+    CaveWorldCfg,
+    OpenWaterWorldCfg,
+    coerce_cave_scene_cfg,
+    load_cave_dataset_world_cfg,
+    load_cave_world_cfg,
+    spawn_open_water_world,
+    spawn_world_assets,
+)
 
 
 @configclass
@@ -169,6 +185,7 @@ class UnderwaterPointNavEnvCfg(DirectRLEnvCfg):
     collision_force_threshold_n = 5.0
     collision_penalty = 20.0
     cave_contact_termination_enabled = False
+    cave_spawn_yaw_jitter_rad = 0.0
 
     position_scale = 0.1
     linear_velocity_scale = 0.5
@@ -196,9 +213,26 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         self._last_control_command: ControlCommand | None = None
         self._last_thruster_command: torch.Tensor | None = None
         self._last_localization: LocalizationOutput | None = None
+        self._held_sensor_frames: dict[str, torch.Tensor] = {}
+        self._cave_scene_variants = tuple(
+            coerce_cave_scene_cfg(scene)
+            for scene in getattr(cfg.world, "scene_variants", ())
+        )
+        if self._cave_scene_variants:
+            cfg.world.scene_variants = self._cave_scene_variants
+        self._cave_scene_assignment_cpu: tuple[int, ...] = ()
+        if self._cave_scene_variants:
+            self._cave_scene_assignment_cpu = balanced_scene_assignment(
+                int(cfg.scene.num_envs), len(self._cave_scene_variants)
+            )
         super().__init__(cfg, render_mode, **kwargs)
 
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
+        self._cave_scene_ids = torch.tensor(
+            self._cave_scene_assignment_cpu or (0,) * self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+        )
         light_channels = int(getattr(cfg, "light_control_channels", 0))
         if bool(getattr(cfg, "light_control_enabled", False)) and light_channels <= 0:
             light_channels = len(cfg.lighting.vehicle_lights)
@@ -228,6 +262,10 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             self.num_envs, dtype=torch.long, device=self.device
         )
         self._last_episode_path_length_m = torch.zeros(self.num_envs, device=self.device)
+        self._last_episode_reference_path_m = torch.zeros(self.num_envs, device=self.device)
+        self._last_episode_spl = torch.zeros(self.num_envs, device=self.device)
+        self._episode_path_length_m = torch.zeros(self.num_envs, device=self.device)
+        self._previous_episode_position_w = torch.zeros(self.num_envs, 3, device=self.device)
         self._exploration_forward_clearance_m = torch.full(
             (self.num_envs,), float(cfg.visual_max_depth_m), device=self.device
         )
@@ -336,32 +374,43 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         self._cave_centerline: torch.Tensor | None = None
         self._cave_chainage: torch.Tensor | None = None
         self._cave_surface_clearance: torch.Tensor | None = None
+        self._multi_cave_centerlines: torch.Tensor | None = None
+        self._multi_cave_chainages: torch.Tensor | None = None
+        self._multi_cave_route_mask: torch.Tensor | None = None
+        self._multi_cave_clearances: torch.Tensor | None = None
+        self._cave_scene_spawn_points = torch.empty((0, 3), device=self.device)
+        self._cave_scene_goal_points = torch.empty((0, 3), device=self.device)
+        self._cave_scene_spawn_chainages = torch.empty(0, device=self.device)
+        self._cave_scene_goal_chainages = torch.empty(0, device=self.device)
+        self._cave_scene_spawn_tangents = torch.empty((0, 3), device=self.device)
+        self._cave_scene_route_lengths = torch.empty(0, device=self.device)
+        self._cave_scene_spawn_jitters = torch.empty(0, device=self.device)
         self._cave_centerline_distance = torch.zeros(self.num_envs, device=self.device)
         self._cave_route_chainage = torch.zeros(self.num_envs, device=self.device)
         self._previous_cave_route_chainage = torch.zeros(self.num_envs, device=self.device)
         self._cave_local_clearance = torch.full((self.num_envs,), float("inf"), device=self.device)
         centerline_path = getattr(self.cfg.world, "centerline_path", None)
-        if centerline_path:
-            rows = list(csv.DictReader(Path(centerline_path).open(encoding="utf-8")))
-            required = ("chainage_m", "north_m", "east_m", "down_m")
-            if not rows or any(field not in rows[0] for field in required):
-                raise ValueError(f"Cave centerline must contain columns {required}: {centerline_path}")
+        if self._cave_scene_variants:
+            self._initialize_multi_cave_routes()
+        elif centerline_path:
+            route = load_cave_route(centerline_path)
+            scale = float(getattr(self.cfg.world, "asset_scale", 1.0))
             self._cave_chainage = torch.tensor(
-                [float(row["chainage_m"]) for row in rows], device=self.device, dtype=torch.float32
+                route.chainage_m, device=self.device, dtype=torch.float32
+            ) * abs(scale)
+            self._cave_centerline = self._transform_cave_points(
+                route.points_m,
+                scale=scale,
+                translation=getattr(self.cfg.world, "asset_translation_m", (0.0, 0.0, 0.0)),
+                orientation=getattr(self.cfg.world, "asset_orientation_wxyz", (1.0, 0.0, 0.0, 0.0)),
             )
-            self._cave_centerline = torch.tensor(
-                [[float(row[axis]) for axis in ("north_m", "east_m", "down_m")] for row in rows],
-                device=self.device,
-                dtype=torch.float32,
-            )
-            if "nominal_surface_clearance_m" in rows[0]:
+            if route.nominal_surface_clearance_m is not None:
                 self._cave_surface_clearance = torch.tensor(
-                    [float(row["nominal_surface_clearance_m"]) for row in rows],
+                    route.nominal_surface_clearance_m,
                     device=self.device,
                     dtype=torch.float32,
-                )
-            if self._cave_centerline.shape[0] < 2:
-                raise ValueError("Cave centerline needs at least two points")
+                ) * abs(scale)
+        self._has_cave_route = self._cave_centerline is not None or self._multi_cave_centerlines is not None
 
         self._cave_portals: tuple[CavePortal, ...] = ()
         self._cave_portal_positions = torch.empty((0, 3), device=self.device)
@@ -369,6 +418,8 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         self._cave_portal_chainages = torch.empty(0, device=self.device)
         self._cave_portal_chainage_directions = torch.empty(0, device=self.device)
         if bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            if self._multi_cave_centerlines is not None:
+                raise ValueError("The legacy cave-entry curriculum does not support multi-cave datasets")
             if self._cave_centerline is None or self._cave_chainage is None:
                 raise ValueError("Cave entry curriculum requires a geometry-derived centerline")
             if self._cave_surface_clearance is None:
@@ -412,6 +463,126 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                 self.device,
             )
 
+    def _transform_cave_points(
+        self,
+        points_m,
+        *,
+        scale: float,
+        translation,
+        orientation,
+    ) -> torch.Tensor:
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("Cave asset_scale must be finite and positive")
+        points = torch.as_tensor(points_m, dtype=torch.float32, device=self.device) * scale
+        if points.ndim != 2 or points.shape[0] == 0 or points.shape[1] != 3:
+            raise ValueError(f"Expected cave points [N,3], got {tuple(points.shape)}")
+        quaternion = torch.as_tensor(orientation, dtype=torch.float32, device=self.device)
+        if quaternion.shape != (4,) or not torch.isfinite(quaternion).all():
+            raise ValueError("Cave asset_orientation_wxyz must be a finite quaternion")
+        quaternion = quaternion / torch.linalg.vector_norm(quaternion).clamp_min(1.0e-8)
+        transformed = rotate_body_to_world(quaternion.unsqueeze(0), points)
+        offset = torch.as_tensor(translation, dtype=torch.float32, device=self.device)
+        if offset.shape != (3,) or not torch.isfinite(offset).all():
+            raise ValueError("Cave asset_translation_m must contain three finite values")
+        return transformed + offset
+
+    def _initialize_multi_cave_routes(self) -> None:
+        """Pad heterogeneous routes for one batched nearest-route query."""
+        routes = [load_cave_route(scene.navigation_path) for scene in self._cave_scene_variants]
+        max_points = max(len(route.points_m) for route in routes)
+        scene_count = len(routes)
+        centerlines = torch.zeros((scene_count, max_points, 3), device=self.device)
+        chainages = torch.zeros((scene_count, max_points), device=self.device)
+        route_mask = torch.zeros((scene_count, max_points), dtype=torch.bool, device=self.device)
+        clearances = torch.full((scene_count, max_points), float("inf"), device=self.device)
+        spawn_points = torch.zeros((scene_count, 3), device=self.device)
+        goal_points = torch.zeros((scene_count, 3), device=self.device)
+        spawn_chainages = torch.zeros(scene_count, device=self.device)
+        goal_chainages = torch.zeros(scene_count, device=self.device)
+        spawn_tangents = torch.zeros((scene_count, 3), device=self.device)
+
+        for scene_id, (scene, route) in enumerate(zip(self._cave_scene_variants, routes)):
+            scale = float(scene.asset_scale)
+            points = self._transform_cave_points(
+                route.points_m,
+                scale=scale,
+                translation=scene.asset_translation_m,
+                orientation=scene.asset_orientation_wxyz,
+            )
+            chainage = torch.tensor(route.chainage_m, dtype=torch.float32, device=self.device) * abs(scale)
+            count = points.shape[0]
+            centerlines[scene_id, :count] = points
+            chainages[scene_id, :count] = chainage
+            route_mask[scene_id, :count] = True
+            if route.nominal_surface_clearance_m is not None:
+                clearances[scene_id, :count] = torch.tensor(
+                    route.nominal_surface_clearance_m,
+                    dtype=torch.float32,
+                    device=self.device,
+                ) * abs(scale)
+
+            if scene.spawn_chainage_m is None:
+                spawn = self._transform_cave_points(
+                    (route.start_m,),
+                    scale=scale,
+                    translation=scene.asset_translation_m,
+                    orientation=scene.asset_orientation_wxyz,
+                )[0]
+                spawn_index = torch.argmin(torch.linalg.vector_norm(points - spawn, dim=-1))
+                spawn_chainage = chainage[spawn_index]
+            else:
+                spawn_chainage = torch.tensor(
+                    float(scene.spawn_chainage_m) * abs(scale), device=self.device
+                ).clamp(chainage[0], chainage[-1])
+                spawn = interpolate_polyline(points, chainage, spawn_chainage.unsqueeze(0))[0]
+
+            if scene.goal_chainage_m is None:
+                goal = self._transform_cave_points(
+                    (route.goal_m,),
+                    scale=scale,
+                    translation=scene.asset_translation_m,
+                    orientation=scene.asset_orientation_wxyz,
+                )[0]
+                goal_index = torch.argmin(torch.linalg.vector_norm(points - goal, dim=-1))
+                goal_chainage = chainage[goal_index]
+            else:
+                goal_chainage = torch.tensor(
+                    float(scene.goal_chainage_m) * abs(scale), device=self.device
+                ).clamp(chainage[0], chainage[-1])
+                goal = interpolate_polyline(points, chainage, goal_chainage.unsqueeze(0))[0]
+            if goal_chainage <= spawn_chainage:
+                raise ValueError(
+                    f"Scene {scene.key!r} goal must lie after its entrance on the navigation route"
+                )
+
+            nearest_spawn = int(torch.argmin((chainage - spawn_chainage).abs()).item())
+            next_index = min(nearest_spawn + 1, count - 1)
+            if next_index == nearest_spawn:
+                next_index = max(0, nearest_spawn - 1)
+            tangent = points[next_index] - points[nearest_spawn]
+            tangent = tangent / torch.linalg.vector_norm(tangent).clamp_min(1.0e-8)
+            spawn_points[scene_id] = spawn
+            goal_points[scene_id] = goal
+            spawn_chainages[scene_id] = spawn_chainage
+            goal_chainages[scene_id] = goal_chainage
+            spawn_tangents[scene_id] = tangent
+
+        self._multi_cave_centerlines = centerlines
+        self._multi_cave_chainages = chainages
+        self._multi_cave_route_mask = route_mask
+        self._multi_cave_clearances = clearances
+        self._cave_scene_spawn_points = spawn_points
+        self._cave_scene_goal_points = goal_points
+        self._cave_scene_spawn_chainages = spawn_chainages
+        self._cave_scene_goal_chainages = goal_chainages
+        self._cave_scene_spawn_tangents = spawn_tangents
+        self._cave_scene_route_lengths = goal_chainages - spawn_chainages
+        self._cave_scene_spawn_jitters = torch.tensor(
+            [float(scene.spawn_jitter_m) for scene in self._cave_scene_variants],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
     def submit_localization_output(self, output: LocalizationOutput, namespace: str | None = None) -> None:
         """Inject an external VIO estimate when the policy state source is VIO."""
         if not isinstance(self._localization_backend, ExternalVIOBackend):
@@ -439,9 +610,37 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             self.cfg.lighting,
             include_vehicle_lights=not self.cfg.scene.clone_in_fabric,
         )
-        world_root = "/World/envs/env_0" if self.cfg.world.clone_per_env else "/World"
-        spawn_open_water_world(self.cfg.world, root_path=world_root, seabed_path="/World/seabed")
-        self.scene.clone_environments(copy_from_source=False)
+        if self._cave_scene_variants:
+            # With replicate_physics=False the scene owns independent env
+            # xforms.  Clone the robot/sensors first, then compose a selected
+            # cave USD under each root so no env inherits env_0's geometry.
+            spawn_open_water_world(
+                OpenWaterWorldCfg(seabed_enabled=False),
+                root_path="/World",
+                seabed_path="/World/seabed",
+            )
+            # Independent copies are required here.  Inheriting clones mirror
+            # later additions below env_0, which would silently turn every
+            # environment into the first cave.
+            self.scene.clone_environments(copy_from_source=True)
+            for env_index, scene_id in enumerate(self._cave_scene_assignment_cpu):
+                scene = self._cave_scene_variants[scene_id]
+                spawn_world_assets(
+                    OpenWaterWorldCfg(
+                        asset_path=scene.visual_asset_path,
+                        collision_asset_path=scene.collision_asset_path,
+                        asset_scale=float(scene.asset_scale),
+                        asset_translation_m=tuple(scene.asset_translation_m),
+                        asset_orientation_wxyz=tuple(scene.asset_orientation_wxyz),
+                        asset_name="Cave",
+                        visual_enabled=bool(self.cfg.world.visual_enabled),
+                    ),
+                    root_path=f"/World/envs/env_{env_index}",
+                )
+        else:
+            world_root = "/World/envs/env_0" if self.cfg.world.clone_per_env else "/World"
+            spawn_open_water_world(self.cfg.world, root_path=world_root, seabed_path="/World/seabed")
+            self.scene.clone_environments(copy_from_source=False)
         if self.cfg.lighting.enabled and self.cfg.scene.clone_in_fabric:
             for env_index in range(self.num_envs):
                 spawn_underwater_lighting(
@@ -460,7 +659,8 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                     env_prims.append(prim)
             self._light_prims_by_env.append(env_prims)
         if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=["/World/seabed"])
+            global_prims = ["/World/seabed"] if self.cfg.world.seabed_enabled else []
+            self.scene.filter_collisions(global_prim_paths=global_prims)
         self.scene.rigid_objects["robot"] = self._robot
         if self._camera is not None:
             self.scene.sensors["camera"] = self._camera
@@ -731,7 +931,7 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             "exploration_clearance": torch.zeros_like(progress),
             "cave_entry": torch.zeros_like(progress),
         }
-        if self._cave_centerline is not None and getattr(self.cfg, "cave_route_reward_enabled", False):
+        if self._has_cave_route and getattr(self.cfg, "cave_route_reward_enabled", False):
             route_progress = self._cave_route_chainage - self._previous_cave_route_chainage
             self._previous_cave_route_chainage = self._cave_route_chainage.detach().clone()
             route_deviation = torch.relu(self._cave_centerline_distance - float(self.cfg.route_deviation_soft_m))
@@ -769,6 +969,7 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        self._refresh_episode_path_length()
         self._refresh_cave_metrics()
         self._refresh_exploration_metrics()
         self._refresh_cave_entry_metrics()
@@ -776,12 +977,12 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         workspace = getattr(self.cfg.world, "navigation_workspace_size_m", None) or self.cfg.workspace_size_m
         half_x, half_y, half_z = (float(value) * 0.5 for value in workspace)
         self._out_of_bounds = (relative_pos[:, 0].abs() > half_x) | (relative_pos[:, 1].abs() > half_y)
-        if self._cave_centerline is None:
+        if not self._has_cave_route:
             self._out_of_bounds |= (relative_pos[:, 2] < 0.25) | (relative_pos[:, 2] > float(workspace[2]))
         else:
             self._out_of_bounds |= relative_pos[:, 2].abs() > half_z
         collision_termination = torch.zeros_like(self._cave_collision)
-        if self._cave_centerline is not None and getattr(self.cfg, "cave_route_reward_enabled", False):
+        if self._has_cave_route and getattr(self.cfg, "cave_route_reward_enabled", False):
             self._out_of_bounds |= self._cave_centerline_distance > float(self.cfg.route_deviation_hard_m)
             if getattr(self.cfg, "cave_contact_termination_enabled", False):
                 collision_termination |= self._cave_collision
@@ -811,7 +1012,7 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         used for teacher shaping and diagnostics, never exposed to the visual
         actor as an observation or treated as proof of free-space connectivity.
         """
-        if self._cave_centerline is None:
+        if not self._has_cave_route:
             self._cave_collision.zero_()
             self._cave_contact_force_n.zero_()
             self._cave_centerline_distance.zero_()
@@ -820,17 +1021,36 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             return
 
         relative_pos = self._robot.data.root_pos_w - self.scene.env_origins
-        distances_sq = torch.sum(
-            (relative_pos.unsqueeze(1) - self._cave_centerline.unsqueeze(0)).square(), dim=-1
-        )
-        nearest_distance_sq, nearest_index = distances_sq.min(dim=1)
-        self._cave_centerline_distance = torch.sqrt(nearest_distance_sq.clamp_min(0.0))
-        assert self._cave_chainage is not None
-        self._cave_route_chainage = self._cave_chainage[nearest_index]
-        if self._cave_surface_clearance is not None:
-            self._cave_local_clearance = self._cave_surface_clearance[nearest_index]
+        if self._multi_cave_centerlines is not None:
+            assert self._multi_cave_chainages is not None
+            assert self._multi_cave_route_mask is not None
+            assert self._multi_cave_clearances is not None
+            centerlines = self._multi_cave_centerlines[self._cave_scene_ids]
+            route_mask = self._multi_cave_route_mask[self._cave_scene_ids]
+            distances_sq = torch.sum(
+                (relative_pos.unsqueeze(1) - centerlines).square(), dim=-1
+            ).masked_fill(~route_mask, float("inf"))
+            nearest_distance_sq, nearest_index = distances_sq.min(dim=1)
+            selected_chainages = self._multi_cave_chainages[self._cave_scene_ids]
+            selected_clearances = self._multi_cave_clearances[self._cave_scene_ids]
+            self._cave_route_chainage = selected_chainages.gather(
+                1, nearest_index.unsqueeze(-1)
+            ).squeeze(-1)
+            self._cave_local_clearance = selected_clearances.gather(
+                1, nearest_index.unsqueeze(-1)
+            ).squeeze(-1)
         else:
-            self._cave_local_clearance.fill_(float("inf"))
+            assert self._cave_centerline is not None and self._cave_chainage is not None
+            distances_sq = torch.sum(
+                (relative_pos.unsqueeze(1) - self._cave_centerline.unsqueeze(0)).square(), dim=-1
+            )
+            nearest_distance_sq, nearest_index = distances_sq.min(dim=1)
+            self._cave_route_chainage = self._cave_chainage[nearest_index]
+            if self._cave_surface_clearance is not None:
+                self._cave_local_clearance = self._cave_surface_clearance[nearest_index]
+            else:
+                self._cave_local_clearance.fill_(float("inf"))
+        self._cave_centerline_distance = torch.sqrt(nearest_distance_sq.clamp_min(0.0))
         self._cave_contact_force_n.zero_()
         if self._contact_sensor is not None:
             net_forces = self._contact_sensor.data.net_forces_w
@@ -838,6 +1058,12 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                 self._cave_contact_force_n = torch.linalg.vector_norm(net_forces, dim=-1).amax(dim=-1)
         self._cave_collision = self._cave_contact_force_n > float(self.cfg.collision_force_threshold_n)
         self._episode_had_collision |= self._cave_collision
+
+    def _refresh_episode_path_length(self) -> None:
+        position = self._robot.data.root_pos_w
+        displacement = torch.linalg.vector_norm(position - self._previous_episode_position_w, dim=-1)
+        self._episode_path_length_m += displacement
+        self._previous_episode_position_w.copy_(position)
 
     def _refresh_exploration_metrics(self) -> None:
         if self._exploration_tracker is None:
@@ -939,6 +1165,29 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                 )
                 self._last_episode_unique_voxels[env_ids] = self._exploration_tracker.visited_count[env_ids]
                 self._last_episode_path_length_m[env_ids] = self._exploration_tracker.path_length_m[env_ids]
+            else:
+                self._last_episode_path_length_m[env_ids] = self._episode_path_length_m[env_ids]
+            if self._multi_cave_centerlines is not None:
+                shortest_path = self._cave_scene_route_lengths[self._cave_scene_ids[env_ids]]
+            elif self._cave_chainage is not None:
+                spawn_chainage = float(getattr(self.cfg.world, "spawn_chainage_m", 0.0))
+                goal_chainage = float(getattr(self.cfg.world, "goal_chainage_m", spawn_chainage))
+                shortest_path = torch.full(
+                    (env_ids.numel(),),
+                    abs(goal_chainage - spawn_chainage),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            else:
+                shortest_path = torch.zeros(env_ids.numel(), device=self.device)
+            self._last_episode_reference_path_m[env_ids] = shortest_path
+            valid_path = shortest_path > 0.0
+            self._last_episode_spl[env_ids] = torch.where(
+                self._success[env_ids] & valid_path,
+                shortest_path
+                / torch.maximum(shortest_path, self._last_episode_path_length_m[env_ids]),
+                torch.zeros_like(shortest_path),
+            )
             self._last_episode_success[env_ids] = self._success[env_ids]
             self._last_episode_out_of_bounds[env_ids] = self._out_of_bounds[env_ids]
             self._last_episode_timeout[env_ids] = self.reset_time_outs[env_ids]
@@ -958,6 +1207,30 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             self.extras["episode_workspace_coverage"] = self._last_episode_workspace_coverage.clone()
             self.extras["episode_unique_voxels"] = self._last_episode_unique_voxels.clone()
             self.extras["episode_path_length_m"] = self._last_episode_path_length_m.clone()
+            self.extras["episode_reference_path_m"] = self._last_episode_reference_path_m.clone()
+            self.extras["episode_spl"] = self._last_episode_spl.clone()
+            self.extras["episode_scene_id"] = self._cave_scene_ids.clone()
+            if self._has_cave_route:
+                self.extras["log"]["Metrics/SPL"] = self._last_episode_spl[env_ids].mean().item()
+                self.extras["log"]["Metrics/path_length_m"] = (
+                    self._last_episode_path_length_m[env_ids].mean().item()
+                )
+            if self._cave_scene_variants:
+                completed_scene_ids = self._cave_scene_ids[env_ids]
+                for scene_id, scene in enumerate(self._cave_scene_variants):
+                    scene_mask = completed_scene_ids == scene_id
+                    if bool(torch.any(scene_mask)):
+                        selected_ids = env_ids[scene_mask]
+                        prefix = f"Scene/{scene.key}"
+                        self.extras["log"][f"{prefix}/success_rate"] = (
+                            self._success[selected_ids].float().mean().item()
+                        )
+                        self.extras["log"][f"{prefix}/collision_rate"] = (
+                            self._episode_had_collision[selected_ids].float().mean().item()
+                        )
+                        self.extras["log"][f"{prefix}/SPL"] = (
+                            self._last_episode_spl[selected_ids].mean().item()
+                        )
             if self._exploration_tracker is not None:
                 self.extras["log"]["Metrics/workspace_coverage_fraction"] = (
                     self._last_episode_workspace_coverage[env_ids].mean().item()
@@ -1000,7 +1273,21 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         root_state = self._robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
         spawn_route_chainage: torch.Tensor | None = None
-        if self._cave_centerline is None:
+        if self._multi_cave_centerlines is not None:
+            scene_ids = self._cave_scene_ids[env_ids]
+            spawn = self._cave_scene_spawn_points[scene_ids].clone()
+            jitter_scale = self._cave_scene_spawn_jitters[scene_ids].unsqueeze(-1)
+            if bool(torch.any(jitter_scale > 0.0)):
+                spawn += torch.randn_like(spawn) * jitter_scale
+            root_state[:, :3] = spawn + self.scene.env_origins[env_ids]
+            self._goal_pos_w[env_ids] = self._cave_scene_goal_points[scene_ids] + self.scene.env_origins[env_ids]
+            spawn_route_chainage = self._cave_scene_spawn_chainages[scene_ids].clone()
+            tangent = self._cave_scene_spawn_tangents[scene_ids]
+            yaw = torch.atan2(tangent[:, 1], tangent[:, 0])
+            yaw_jitter = float(getattr(self.cfg, "cave_spawn_yaw_jitter_rad", 0.0))
+            if yaw_jitter > 0.0:
+                yaw += torch.empty(count, device=self.device).uniform_(-yaw_jitter, yaw_jitter)
+        elif self._cave_centerline is None:
             root_state[:, :2] += torch.empty(count, 2, device=self.device).uniform_(
                 -self.cfg.reset_xy_m, self.cfg.reset_xy_m
             )
@@ -1032,6 +1319,10 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             yaw = torch.full((count,), torch.atan2(tangent[1], tangent[0]).item(), device=self.device)
             if bool(getattr(self.cfg, "exploration_random_yaw", False)):
                 yaw.uniform_(-math.pi, math.pi)
+            else:
+                yaw_jitter = float(getattr(self.cfg, "cave_spawn_yaw_jitter_rad", 0.0))
+                if yaw_jitter > 0.0:
+                    yaw += torch.empty(count, device=self.device).uniform_(-yaw_jitter, yaw_jitter)
         root_state[:, 3:7] = 0.0
         root_state[:, 3] = torch.cos(0.5 * yaw)
         root_state[:, 6] = torch.sin(0.5 * yaw)
@@ -1039,7 +1330,7 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
 
-        if self._cave_centerline is None:
+        if not self._has_cave_route:
             angle = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
             radius = torch.empty(count, device=self.device).uniform_(*self.cfg.goal_distance_range_m)
             self._goal_pos_w[env_ids, 0] = self.scene.env_origins[env_ids, 0] + radius * torch.cos(angle)
@@ -1053,6 +1344,8 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         self._previous_distance[env_ids] = torch.linalg.vector_norm(
             self._goal_pos_w[env_ids] - root_state[:, :3], dim=-1
         )
+        self._episode_path_length_m[env_ids] = 0.0
+        self._previous_episode_position_w[env_ids] = root_state[:, :3]
         self._success[env_ids] = False
         self._out_of_bounds[env_ids] = False
         self._cave_collision[env_ids] = False
@@ -1187,6 +1480,34 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             frame_dropped = torch.rand(self.num_envs, device=self.device) < self._domain_gap_samples[
                 "frame_drop_probability"
             ]
+            # A recurrent control policy needs a fixed tensor every step.
+            # Model a dropped frame as the common camera-driver behaviour of
+            # holding the last image, while metadata still reports the drop.
+            for name, image in (
+                ("rgb", rgb),
+                ("depth", depth),
+                ("rgb_right", rgb_right),
+                ("depth_right", depth_right),
+            ):
+                if image is None:
+                    continue
+                previous = self._held_sensor_frames.get(name)
+                if previous is None or previous.shape != image.shape:
+                    previous = image.detach().clone()
+                    self._held_sensor_frames[name] = previous
+                mask = frame_dropped.reshape(self.num_envs, *([1] * (image.ndim - 1)))
+                held = torch.where(mask, previous, image)
+                previous.copy_(held)
+                if name == "rgb":
+                    rgb = held
+                elif name == "depth":
+                    depth = held
+                elif name == "rgb_right":
+                    rgb_right = held
+                else:
+                    depth_right = held
+            if self._camera_left is not None:
+                rgb_left, depth_left = rgb, depth
         packets = []
         for robot_index in range(self.num_envs):
             packet_timestamp = timestamp_s + float(jitter[robot_index].item())
@@ -1218,12 +1539,12 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                 SensorPacket(
                     namespace=f"robot_{robot_index:03d}",
                     timestamp_s=packet_timestamp,
-                    rgb=None if rgb is None or dropped else rgb[robot_index],
-                    depth=None if depth is None or dropped else depth[robot_index],
-                    rgb_left=None if rgb_left is None or dropped else rgb_left[robot_index],
-                    rgb_right=None if rgb_right is None or dropped else rgb_right[robot_index],
-                    depth_left=None if depth_left is None or dropped else depth_left[robot_index],
-                    depth_right=None if depth_right is None or dropped else depth_right[robot_index],
+                    rgb=None if rgb is None else rgb[robot_index],
+                    depth=None if depth is None else depth[robot_index],
+                    rgb_left=None if rgb_left is None else rgb_left[robot_index],
+                    rgb_right=None if rgb_right is None else rgb_right[robot_index],
+                    depth_left=None if depth_left is None else depth_left[robot_index],
+                    depth_right=None if depth_right is None else depth_right[robot_index],
                     imu_acceleration=None if imu_acceleration is None else imu_acceleration[robot_index],
                     imu_angular_velocity=None if imu_angular_velocity is None else imu_angular_velocity[robot_index],
                     pressure_depth_m=pressure_depth[robot_index],
@@ -1511,6 +1832,29 @@ def _default_cave_world(config_name: str, *, visual_enabled: bool) -> CaveWorldC
     return world
 
 
+def _default_multi_cave_world() -> CaveWorldCfg:
+    """Resolve the selected v01 profile without requiring USDs at import time."""
+    import os
+
+    profile = os.environ.get("ISAAC_UNDERWATER_CAVE_PROFILE", "train_all")
+    return load_cave_dataset_world_cfg(
+        "worlds/caves_difficulty_v01.yaml",
+        profile=profile,
+        require_converted=False,
+    )
+
+
+def _multicave_domain_randomization_enabled() -> bool:
+    import os
+
+    return os.environ.get("ISAAC_UNDERWATER_MULTICAVE_DOMAIN_RANDOMIZATION", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 @configclass
 class UnderwaterCavePointNavEnvCfg(UnderwaterPointNavEnvCfg):
     """State/teacher cave task using collision-only cave copies for PPO throughput."""
@@ -1596,6 +1940,47 @@ class UnderwaterCaveVisualPilotEnvCfg(UnderwaterCaveStereoEnvCfg):
         replicate_physics=False,
         clone_in_fabric=False,
     )
+
+
+@configclass
+class UnderwaterMultiCaveNavigationEnvCfg(UnderwaterCaveVisualPilotEnvCfg):
+    """One recurrent exit-navigation policy trained across heterogeneous caves.
+
+    Every environment is statically bound to one cave for the lifetime of the
+    simulator.  The round-robin assignment balances transition counts while
+    all environments update the same PPO actor/critic weights.
+    """
+
+    episode_length_s = 180.0
+    goal_threshold_m = 1.0
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=6,
+        # The hard mesh spans roughly 74 x 50 m.  Wide spacing prevents static
+        # triangle meshes from adjacent environments overlapping in PhysX.
+        env_spacing=200.0,
+        replicate_physics=False,
+        # Geometry cannot overlap at 200 m spacing, so an expensive global
+        # collision collection is unnecessary for this heterogeneous task.
+        filter_collisions=False,
+        clone_in_fabric=False,
+    )
+    world: CaveWorldCfg = _default_multi_cave_world()
+    domain_randomization_enabled = _multicave_domain_randomization_enabled()
+
+    cave_route_reward_enabled = True
+    cave_contact_termination_enabled = True
+    cave_spawn_yaw_jitter_rad = 0.35
+    route_progress_weight = 2.5
+    route_deviation_penalty_weight = 0.35
+    route_deviation_soft_m = 0.65
+    route_deviation_hard_m = 2.25
+    centerline_clearance_penalty_weight = 0.0
+    collision_penalty = 25.0
+    progress_weight = 0.25
+    goal_bonus = 100.0
+    heading_weight = 0.0
+    action_penalty_weight = 0.002
+    out_of_bounds_penalty = 25.0
 
 
 @configclass

@@ -1,0 +1,64 @@
+schema_version: 1
+name: caves_difficulty_v01
+asset_root_env: ISAAC_UNDERWATER_ASSET_ROOT
+asset_root_default: /home/kenton/Downloads/assets
+checksums: caves_difficulty_v01/checksums.json
+navigation_workspace_size_m: [180.0, 120.0, 20.0]
+scale_status: verified_export_in_metres
+candidate_status: geometry_verified_policy_unvalidated
+license_status: not_provided_in_archive
+visual_enabled: true
+
+# train_all is the operational profile.  The leave-one-out profiles are for
+# honest geometry-generalization measurements; three scenes are not enough for
+# a conventional train/validation/test split and must not be reported as one.
+profiles:
+  train_all: [easy, medium, hard]
+  loo_easy_train: [medium, hard]
+  loo_easy_eval: [easy]
+  loo_medium_train: [easy, hard]
+  loo_medium_eval: [medium]
+  loo_hard_train: [easy, medium]
+  loo_hard_eval: [hard]
+
+scenes:
+  easy:
+    name: caves_difficulty_v01_easy
+    difficulty: easy
+    visual_source: caves_difficulty_v01/easy/cave_easy.obj
+    # No reduced collision export was included.  This verified visual surface
+    # is an explicit high-poly fallback until the source collision mesh arrives.
+    collision_source: caves_difficulty_v01/easy/cave_easy.obj
+    collision_status: high_poly_visual_mesh_fallback
+    navigation: caves_difficulty_v01/easy/navigation_z_up.json
+    metadata: caves_difficulty_v01/easy/metadata.json
+    asset_scale: 1.0
+    asset_translation_m: [0.0, 0.0, 0.0]
+    asset_orientation_wxyz: [1.0, 0.0, 0.0, 0.0]
+    spawn_jitter_m: 0.10
+
+  medium:
+    name: caves_difficulty_v01_medium
+    difficulty: medium
+    visual_source: caves_difficulty_v01/medium/cave_medium.obj
+    collision_source: caves_difficulty_v01/medium/cave_medium.obj
+    collision_status: high_poly_visual_mesh_fallback
+    navigation: caves_difficulty_v01/medium/navigation_z_up.json
+    metadata: caves_difficulty_v01/medium/metadata.json
+    asset_scale: 1.0
+    asset_translation_m: [0.0, 0.0, 0.0]
+    asset_orientation_wxyz: [1.0, 0.0, 0.0, 0.0]
+    spawn_jitter_m: 0.10
+
+  hard:
+    name: caves_difficulty_v01_hard
+    difficulty: hard
+    visual_source: caves_difficulty_v01/hard/cave_hard.obj
+    collision_source: caves_difficulty_v01/hard/cave_hard.obj
+    collision_status: high_poly_visual_mesh_fallback
+    navigation: caves_difficulty_v01/hard/navigation_z_up.json
+    metadata: caves_difficulty_v01/hard/metadata.json
+    asset_scale: 1.0
+    asset_translation_m: [0.0, 0.0, 0.0]
+    asset_orientation_wxyz: [1.0, 0.0, 0.0, 0.0]
+    spawn_jitter_m: 0.08

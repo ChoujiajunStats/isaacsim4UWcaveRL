@@ -150,3 +150,20 @@ The entry reward is sparse; weak voxel novelty only supports visual search.
 The Porth portal-inference and pipeline contracts pass, but the one-update
 checkpoint is not trained. Success on held-out cave geometry remains to be
 demonstrated.
+
+## Shared multi-cave exit navigator
+
+`Isaac-Underwater-Cave-Navigation-v0` binds parallel environments to the
+easy/medium/hard caves in a balanced round robin while training one shared
+stereo-CNN + GRU PPO policy. Run its finite end-to-end gate with:
+
+```bash
+MAX_ITERATIONS=1 NUM_ENVS=6 RUN_NAME=multicave_contract \
+  ./scripts/run_multicave_navigation_rl_pipeline.sh
+```
+
+The actor receives a relative exit command but no cave identity, map, route,
+or centerline. The reference route is used only for reward shaping and SPL-like
+evaluation. Use `--episodes_per_scene` for balanced evaluation and the
+leave-one-out profiles for unseen-geometry measurements. See
+`docs/MULTICAVE_NAVIGATION.md` for training, acceptance, and limitations.

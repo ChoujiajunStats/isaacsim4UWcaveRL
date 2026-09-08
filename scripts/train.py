@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import runpy
 import sys
 from pathlib import Path
@@ -11,6 +12,36 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ISAACLAB_ROOT = PROJECT_ROOT / ".deps" / "IsaacLab"
 TRAIN_SCRIPT = ISAACLAB_ROOT / "scripts" / "reinforcement_learning" / "rsl_rl" / "train.py"
+
+
+def _consume_local_option(name: str) -> str | None:
+    """Remove one project-only option before Isaac Lab parses argv."""
+    prefix = name + "="
+    for index, value in enumerate(tuple(sys.argv[1:]), start=1):
+        if value.startswith(prefix):
+            del sys.argv[index]
+            return value[len(prefix) :]
+        if value == name:
+            if index + 1 >= len(sys.argv):
+                raise ValueError(f"{name} requires a value")
+            result = sys.argv[index + 1]
+            del sys.argv[index : index + 2]
+            return result
+    return None
+
+
+def _consume_local_flag(name: str) -> bool:
+    if name not in sys.argv[1:]:
+        return False
+    sys.argv.remove(name)
+    return True
+
+
+cave_profile = _consume_local_option("--cave_dataset_profile")
+if cave_profile:
+    os.environ["ISAAC_UNDERWATER_CAVE_PROFILE"] = cave_profile
+if _consume_local_flag("--domain_randomization"):
+    os.environ["ISAAC_UNDERWATER_MULTICAVE_DOMAIN_RANDOMIZATION"] = "1"
 
 sys.path.insert(0, str(PROJECT_ROOT / "source" / "isaac_underwater"))
 sys.path.insert(0, str(TRAIN_SCRIPT.parent))

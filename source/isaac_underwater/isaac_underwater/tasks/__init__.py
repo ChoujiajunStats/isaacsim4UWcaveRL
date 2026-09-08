@@ -112,3 +112,18 @@ gym.register(
         ),
     },
 )
+
+gym.register(
+    id="Isaac-Underwater-Cave-Navigation-v0",
+    entry_point="isaac_underwater.tasks.direct.pointnav_env:UnderwaterPointNavEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaac_underwater.tasks.direct.pointnav_env:UnderwaterMultiCaveNavigationEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            "isaac_underwater.tasks.direct.agents.visual_ppo_cfg:"
+            "UnderwaterMultiCaveNavigationPPORunnerCfg"
+        ),
+    },
+)

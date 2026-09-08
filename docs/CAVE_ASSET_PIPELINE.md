@@ -59,6 +59,7 @@ Isaac-Underwater-Cave-Stereo-v0       visual + stereo RGB/depth/IMU/lights
 Isaac-Underwater-Cave-VisualPilot-v0  visual actor + privileged critic PPO
 Isaac-Underwater-Cave-Explore-v0      no-goal stereo CNN + GRU exploration PPO
 Isaac-Underwater-Cave-Entry-v0        automatic-portal vision-only entry PPO
+Isaac-Underwater-Cave-Navigation-v0   shared recurrent multi-cave exit PPO
 ```
 
 The stereo cave task now resolves the default Porth world directly through the
@@ -86,3 +87,10 @@ yaw, and terminates successfully after a sparse portal-crossing event. Its
 1549-D actor still receives no goal, centerline, portal coordinate, or
 visitation grid. A one-update train/evaluate/checkpoint gate passes; policy
 convergence and cross-cave portal inference are not yet validated.
+
+The separate `caves_difficulty_v01` registry provides easy/medium/hard
+entrance-to-exit scenes, balanced parallel assignment, and leave-one-out
+profiles for the shared recurrent navigation task. Those downloaded meshes
+remain external and currently use their high-poly visual OBJs as collision
+fallbacks because no reduced collision exports or license file were included.
+See `docs/MULTICAVE_NAVIGATION.md` for the exact task and validation contract.

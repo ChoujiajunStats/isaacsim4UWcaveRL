@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -14,10 +15,23 @@ parser.add_argument("--task", type=str, default="Isaac-Underwater-PointNav-Direc
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--num_envs", type=int, default=32)
 parser.add_argument("--steps", type=int, default=20)
+parser.add_argument(
+    "--cave_dataset_profile",
+    default=None,
+    help="Override the multi-cave manifest profile before task registration.",
+)
+parser.add_argument("--domain_randomization", action="store_true")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
-if "VisualPilot" in args.task or "Cave-Explore" in args.task or "Cave-Entry" in args.task:
+if args.cave_dataset_profile:
+    os.environ["ISAAC_UNDERWATER_CAVE_PROFILE"] = args.cave_dataset_profile
+if args.domain_randomization:
+    os.environ["ISAAC_UNDERWATER_MULTICAVE_DOMAIN_RANDOMIZATION"] = "1"
+if any(
+    marker in args.task
+    for marker in ("VisualPilot", "Cave-Explore", "Cave-Entry", "Cave-Navigation")
+):
     args.enable_cameras = True
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
@@ -40,6 +54,8 @@ def main() -> None:
     print("ppo_smoke: building environment", flush=True)
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
     env_cfg.seed = 42
+    if args.domain_randomization:
+        env_cfg.domain_randomization_enabled = True
     env = gym.make(args.task, cfg=env_cfg)
     if not isinstance(env.unwrapped, DirectRLEnv):
         raise TypeError(f"Expected DirectRLEnv, got {type(env.unwrapped)}")

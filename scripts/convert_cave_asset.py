@@ -19,6 +19,11 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", default="worlds/porth_yr_ogof_sump9.yaml")
+parser.add_argument(
+    "--profile",
+    default=None,
+    help="Named profile when --config is a multi-cave dataset manifest.",
+)
 parser.add_argument("--force", action="store_true")
 parser.add_argument("--usd-root", default=None)
 AppLauncher.add_app_launcher_args(parser)
@@ -30,7 +35,7 @@ simulation_app = app_launcher.app
 from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
 from isaaclab.sim.schemas import schemas_cfg
 
-from isaac_underwater.worlds import resolve_cave_asset
+from isaac_underwater.worlds import CaveAssetPaths, resolve_cave_asset, resolve_cave_dataset
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -68,17 +73,14 @@ def convert(source: Path, destination: Path, *, collision: bool) -> Path:
     return Path(converter.usd_path)
 
 
-def main() -> None:
-    asset = resolve_cave_asset(args.config)
-    output_root = Path(
-        args.usd_root
-        or PROJECT_ROOT / "outputs" / "cave_assets"
-    ).expanduser().resolve()
+def convert_asset(asset: CaveAssetPaths, output_root: Path) -> None:
     output_dir = output_root / asset.name
     visual_usd = convert(asset.visual_source, output_dir / "visual.usd", collision=False)
     collision_usd = convert(asset.collision_source, output_dir / "collision.usd", collision=True)
     manifest = {
         "name": asset.name,
+        "key": asset.key,
+        "difficulty": asset.difficulty,
         "visual_source": str(asset.visual_source),
         "collision_source": str(asset.collision_source),
         "visual_sha256": sha256(asset.visual_source),
@@ -89,12 +91,32 @@ def main() -> None:
         "centerline": str(asset.centerline_path) if asset.centerline_path else None,
         "scale_status": asset.scale_status,
         "candidate_status": asset.candidate_status,
+        "collision_source_status": asset.collision_status,
         "collision_model": "provided_mesh_triangle_collision",
         "validation_status": "NOT_YET_VALIDATED_IN_ISAAC",
     }
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"manifest -> {manifest_path}", flush=True)
+
+
+def main() -> None:
+    output_root = Path(
+        args.usd_root
+        or PROJECT_ROOT / "outputs" / "cave_assets"
+    ).expanduser().resolve()
+    if args.profile is None:
+        assets = (resolve_cave_asset(args.config),)
+    else:
+        dataset = resolve_cave_dataset(args.config, args.profile)
+        assets = dataset.scenes
+        print(
+            f"dataset={dataset.name} profile={dataset.profile} scenes={len(assets)} "
+            f"license_status={dataset.license_status}",
+            flush=True,
+        )
+    for asset in assets:
+        convert_asset(asset, output_root)
 
 
 if __name__ == "__main__":

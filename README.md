@@ -187,7 +187,8 @@ The current model uses PhysX rigid-body gravity plus an explicit buoyancy,
 linear/quadratic drag, angular drag, current, optional diagonal added-mass,
 and center-of-buoyancy restoring torque layer. It intentionally does not model
 waves, particles, fluid simulation, sonar, or DVL. Cave visual/collision asset
-loading is available, while route-level free-space and direct PPO validation
+loading is available. The difficulty-v01 supplied routes and shared PPO wiring
+are validated; learned-policy convergence and independent-cave generalization
 remain follow-up work.
 
 GUI and camera modes attach the detailed BlueROV2 visual from
@@ -266,3 +267,16 @@ MAX_ITERATIONS=1 NUM_ENVS=2 EVAL_ENVS=1 EVAL_EPISODES=1 \
 The Porth portal and finite PPO pipeline pass, but the saved one-update policy
 is an untrained baseline; held-out entrance discovery remains unvalidated. See
 [`docs/VISUAL_NAVIGATION_VALIDATION.md`](docs/VISUAL_NAVIGATION_VALIDATION.md).
+
+The downloaded `caves_difficulty_v01` easy/medium/hard set is supported by a
+separate shared recurrent exit-navigation task:
+
+```bash
+MAX_ITERATIONS=1 NUM_ENVS=6 RUN_NAME=multicave_contract \
+  ./scripts/run_multicave_navigation_rl_pipeline.sh
+```
+
+This finite default validates heterogeneous scene assignment, entrance/exit
+semantics, PPO, checkpoint reload, and balanced evaluation; it is not a
+convergence result. Training and leave-one-cave-out evaluation are documented
+in [`docs/MULTICAVE_NAVIGATION.md`](docs/MULTICAVE_NAVIGATION.md).
