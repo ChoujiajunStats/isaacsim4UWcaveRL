@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -79,8 +80,8 @@ def main() -> None:
         assert torch.isfinite(actions).all()
         assert torch.isfinite(rewards).all()
         reward_sum += rewards
-        if hasattr(policy, "reset"):
-            policy.reset(dones)
+        with torch.inference_mode():
+            runner.alg.policy.reset(dones)
 
     assert torch.isfinite(reward_sum).all()
     print(
@@ -95,5 +96,11 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        traceback.print_exc()
+        import omni.kit.app
+
+        omni.kit.app.get_app().post_quit(1)
+        raise
     finally:
         simulation_app.close()

@@ -42,6 +42,10 @@ if cave_profile:
     os.environ["ISAAC_UNDERWATER_CAVE_PROFILE"] = cave_profile
 if _consume_local_flag("--domain_randomization"):
     os.environ["ISAAC_UNDERWATER_MULTICAVE_DOMAIN_RANDOMIZATION"] = "1"
+if _consume_local_flag("--navigation_curriculum"):
+    # Training-only Hydra override: a later evaluator process retains the
+    # entrance spawn unless explicitly configured otherwise.
+    sys.argv.append("env.navigation_curriculum_enabled=True")
 
 sys.path.insert(0, str(PROJECT_ROOT / "source" / "isaac_underwater"))
 sys.path.insert(0, str(TRAIN_SCRIPT.parent))

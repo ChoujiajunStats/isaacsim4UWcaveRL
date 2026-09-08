@@ -65,15 +65,24 @@ The 19-value critic uses the compact privileged navigation state during
 training. A stereo CNN encodes images and a 128-state GRU supplies memory for
 turns, occlusions, and branch decisions.
 
-Training reward combines forward progress along the supplied reference route,
+Training reward combines continuous projected progress along the supplied reference route,
 a soft route-deviation penalty, weak direct exit-distance progress, action
 cost, collision/out-of-bounds penalties, and a terminal exit bonus. The route
 is therefore a training teacher and evaluator reference only. Success means
 reaching within 1 m of the route's outside-exit endpoint; contact, excessive
 route deviation, and workspace escape terminate an episode.
 
-The 180 s horizon is long enough for the hard reference route at the configured
-vehicle command limits. Cave worlds deliberately have no global `z=0` seabed:
+The 300 s horizon allows cautious turns: a privileged reference follower needs
+about 81, 139, and 172 s on easy, medium, and hard with the actual thruster and
+drag model. All three physical traversals are collision-free. Run the geometry
+and controller check independently of PPO:
+
+```bash
+./.venv/bin/python scripts/smoke_cave_route_following.py --headless --device cuda:0
+```
+
+This controller receives the full reference route and is not a learned policy
+or generalization result. Cave worlds deliberately have no global `z=0` seabed:
 that plane intersected the entrance geometry and produced false initial
 contacts.
 
@@ -109,7 +118,7 @@ episodes on the pinned Isaac Lab 2.3 stack.
 A first full experiment can use:
 
 ```bash
-MAX_ITERATIONS=2000 NUM_ENVS=6 DOMAIN_RANDOMIZATION=1 \
+MAX_ITERATIONS=2000 NUM_ENVS=6 NAVIGATION_CURRICULUM=1 \
 RUN_NAME=multicave_full \
   ./scripts/run_multicave_navigation_rl_pipeline.sh
 ```
@@ -119,6 +128,24 @@ recurrent PPO minibatches. Increase environment count only in multiples of
 three and after checking RTX memory and steps/second. Domain randomization
 resamples dynamics, actuation, current, image degradation, IMU, and timing
 parameters per environment at reset.
+
+`NAVIGATION_CURRICULUM=1` enables a training-only reverse curriculum. Each cave
+starts 4 m from its exit. After at least 7 successes in a sliding window of 10
+episodes at its current frontier, that cave's remaining distance grows by 1.5,
+up to its complete entrance-to-exit route. Caves advance independently. Old
+episodes that finish after a frontier change do not promote the new frontier.
+Short episodes use a shorter time limit (`10 + 4 * distance` seconds, capped at
+300 s). The actual exit command stays unchanged and route annotations remain
+hidden from the actor. Curriculum successes must not be reported as full-route
+successes. The evaluator always disables the curriculum and uses true entrance
+spawns.
+
+The curriculum can also be enabled directly with `scripts/train.py
+--navigation_curriculum`. Its frontier is environment state, not policy weights;
+resuming PPO currently restarts the curriculum unless a different
+`env.navigation_curriculum_initial_distance_m` is supplied. Start with nominal
+conditions, then enable `DOMAIN_RANDOMIZATION=1` to assess learning under the
+configured dynamics and sensor variation.
 
 ## Balanced evaluation
 
@@ -154,7 +181,7 @@ train/validation/test split would be misleading. Use all three leave-one-out
 runs as a minimum geometry-generalization check:
 
 ```bash
-PROFILE=loo_hard_train MAX_ITERATIONS=2000 NUM_ENVS=6 \
+PROFILE=loo_hard_train MAX_ITERATIONS=2000 NUM_ENVS=6 NAVIGATION_CURRICULUM=1 \
 DOMAIN_RANDOMIZATION=1 RUN_NAME=loo_hard \
   ./scripts/run_multicave_navigation_rl_pipeline.sh
 
@@ -182,8 +209,16 @@ The following contracts pass on the RTX 4060 workstation:
 - heterogeneous three-scene spawning with the expected USD in every env;
 - safe entrance spawn and forced exit success/SPL semantics;
 - hard-wall contact followed by a clean, non-terminal automatic reset;
+- continuous segment progress, per-cave curriculum promotion, and safe promoted spawns;
+- full collision-free reference-controller traversal of all three scenes;
 - nominal and forced-frame-drop domain-randomized visual observations;
 - one-update recurrent PPO training, checkpoint loading, and balanced metrics.
 
-No converged checkpoint or held-out success result exists yet. The current
-one-update checkpoint is deliberately an untrained integration artifact.
+The 100-update nominal baseline `2026-09-08_19-17-27_multicave_nominal_sanity_v2`
+completed 38,400 transitions after the contact-reset fix. Its full-route check
+completed three episodes per scene with 0/9 successes, 2/9 collisions, and a
+mean travelled path of 3.81 m. This baseline used nearest-vertex progress and
+no curriculum. The evaluator clears recurrent memory between episodes;
+training episode logs now publish only when a new episode finishes.
+
+No converged checkpoint or held-out success result has been established.

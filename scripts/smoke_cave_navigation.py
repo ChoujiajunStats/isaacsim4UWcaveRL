@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=3)
 parser.add_argument("--profile", default="train_all")
 parser.add_argument("--domain_randomization", action="store_true")
+parser.add_argument("--navigation_curriculum", action="store_true")
 parser.add_argument(
     "--collision_reset_steps",
     type=int,
@@ -38,11 +39,13 @@ import torch
 
 import isaac_underwater.tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
+from isaac_underwater.navigation.route_geometry import sample_polyline
 
 
 def main() -> None:
     task = "Isaac-Underwater-Cave-Navigation-v0"
     cfg = parse_env_cfg(task, device=args.device, num_envs=args.num_envs)
+    cfg.navigation_curriculum_enabled = args.navigation_curriculum
     if args.collision_reset_steps > 0:
         # Let the robot reach the physical wall before the route-deviation
         # safety bound terminates the diagnostic episode.
@@ -61,6 +64,16 @@ def main() -> None:
 
         relative_spawn = unwrapped._robot.data.root_pos_w - unwrapped.scene.env_origins
         expected_spawn = unwrapped._cave_scene_spawn_points[unwrapped._cave_scene_ids]
+        if args.navigation_curriculum:
+            ids = unwrapped._cave_scene_ids
+            expected_spawn, _ = sample_polyline(
+                unwrapped._cave_scene_goal_chainages[ids] - unwrapped._exit_curriculum.distance_m[ids],
+                unwrapped._multi_cave_centerlines[ids],
+                unwrapped._multi_cave_chainages[ids],
+                unwrapped._multi_cave_route_mask[ids],
+            )
+            assert torch.all(unwrapped._episode_route_reference_m <= cfg.navigation_curriculum_initial_distance_m + 1.e-4)
+            assert torch.all(unwrapped._episode_navigation_horizon_steps < unwrapped.max_episode_length)
         spawn_error = torch.linalg.vector_norm(relative_spawn - expected_spawn, dim=-1)
         assert torch.all(spawn_error < 0.75), f"spawn error too large: {spawn_error}"
         assert torch.all(unwrapped._cave_scene_route_lengths > 1.0)
@@ -176,6 +189,10 @@ def main() -> None:
                             "Raw contact force stayed stale after reset: "
                             f"trace={post_reset_trace}"
                         )
+                        if not torch.any(next_terminated | next_truncated):
+                            assert "log" not in next_extras, (
+                                "Non-terminal steps must not repeat a completed-episode log"
+                            )
                     break
             assert collision_seen, (
                 f"No hard-scene contact occurred within {args.collision_reset_steps} steps"
@@ -200,6 +217,23 @@ def main() -> None:
         assert torch.all(extras["episode_reference_path_m"] > 1.0)
         assert torch.all((extras["episode_spl"] > 0.0) & (extras["episode_spl"] <= 1.0))
         assert torch.all(reward > 0.25 * float(cfg.goal_bonus))
+        if args.navigation_curriculum:
+            initial_frontiers = unwrapped._exit_curriculum.distance_m.clone()
+            for _ in range(cfg.navigation_curriculum_window - 1):
+                unwrapped._robot.write_root_pose_to_sim(pose)
+                unwrapped._robot.write_root_velocity_to_sim(
+                    torch.zeros(args.num_envs, 6, device=unwrapped.device)
+                )
+                _, _, _, _, extras = env.step(torch.zeros(args.num_envs, 6, device=unwrapped.device))
+                assert torch.all(extras["episode_success"])
+                if torch.all(unwrapped._exit_curriculum.distance_m > initial_frontiers):
+                    break
+            torch.testing.assert_close(
+                unwrapped._exit_curriculum.distance_m,
+                torch.minimum(initial_frontiers * cfg.navigation_curriculum_growth, unwrapped._cave_scene_route_lengths),
+            )
+            _, _, terminated, truncated, _ = env.step(torch.zeros(args.num_envs, 6, device=unwrapped.device))
+            assert not torch.any(terminated | truncated), "Promoted curriculum spawn must be safe"
 
         scene_summary = ",".join(
             f"{scene.key}:{int((unwrapped._cave_scene_ids == index).sum())}"
@@ -221,6 +255,10 @@ if __name__ == "__main__":
         main()
     except BaseException:
         traceback.print_exc()
+        # Kit's fast shutdown otherwise exits with 0 even on an assertion.
+        import omni.kit.app
+
+        omni.kit.app.get_app().post_quit(1)
         raise
     finally:
         simulation_app.close()

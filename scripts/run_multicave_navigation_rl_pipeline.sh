@@ -15,6 +15,7 @@ EVAL_ENVS="${EVAL_ENVS:-3}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-1}"
 RUN_NAME="${RUN_NAME:-multicave_pipeline}"
 DOMAIN_RANDOMIZATION="${DOMAIN_RANDOMIZATION:-0}"
+NAVIGATION_CURRICULUM="${NAVIGATION_CURRICULUM:-0}"
 DATASET_CONFIG="${DATASET_CONFIG:-worlds/caves_difficulty_v01.yaml}"
 EXPERIMENT_ROOT="${PROJECT_ROOT}/logs/rsl_rl/underwater_cave_multinav"
 
@@ -44,6 +45,13 @@ case "${DOMAIN_RANDOMIZATION,,}" in
     ;;
 esac
 
+TRAIN_ARGS=()
+case "${NAVIGATION_CURRICULUM,,}" in
+  1|true|yes|on) TRAIN_ARGS+=(--navigation_curriculum) ;;
+  0|false|no|off) ;;
+  *) echo "NAVIGATION_CURRICULUM must be 0/1 or false/true" >&2; exit 2 ;;
+esac
+
 cd "${PROJECT_ROOT}"
 
 PYTHONPATH="${PROJECT_ROOT}/source/isaac_underwater${PYTHONPATH:+:${PYTHONPATH}}" \
@@ -66,6 +74,7 @@ PYTHONPATH="${PROJECT_ROOT}/source/isaac_underwater${PYTHONPATH:+:${PYTHONPATH}}
   --task "${TASK}" \
   --cave_dataset_profile "${PROFILE}" \
   "${DOMAIN_ARGS[@]}" \
+  "${TRAIN_ARGS[@]}" \
   --num_envs "${NUM_ENVS}" \
   --max_iterations "${MAX_ITERATIONS}" \
   --run_name "${RUN_NAME}" \

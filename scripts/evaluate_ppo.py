@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -97,6 +98,9 @@ def main() -> None:
 
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
     env_cfg.seed = args.seed
+    # Navigation acceptance always starts at the true entrance, even when
+    # the checkpoint was trained with shortened reverse-curriculum episodes.
+    env_cfg.navigation_curriculum_enabled = False
     if args.episode_length_s is not None:
         env_cfg.episode_length_s = args.episode_length_s
     if args.current_mode is not None:
@@ -223,8 +227,11 @@ def main() -> None:
                 scene_episode_counts[scene_id] += 1
         episode_returns[done_ids] = 0.0
         episode_lengths[done_ids] = 0
-        if hasattr(policy, "reset"):
-            policy.reset(dones)
+        # get_inference_policy() returns the bound act_inference method, not
+        # the module.  Reset the owning module so GRU state cannot leak from
+        # a completed episode into the next one (or between evaluation seeds).
+        with torch.inference_mode():
+            runner.alg.policy.reset(dones)
         if len(completed_returns) >= required_episodes:
             break
 
@@ -244,6 +251,7 @@ def main() -> None:
         "rollout_steps": rollout_step,
         "seed": args.seed,
         "episode_length_s": float(env_cfg.episode_length_s),
+        "navigation_curriculum": False,
         "hydrodynamics_preset": getattr(env_cfg, "hydrodynamics_preset", None),
         "domain_randomization": bool(getattr(env_cfg, "domain_randomization_enabled", False)),
         "current_mode": getattr(env_cfg, "current_mode", None),
@@ -324,5 +332,11 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        traceback.print_exc()
+        import omni.kit.app
+
+        omni.kit.app.get_app().post_quit(1)
+        raise
     finally:
         simulation_app.close()

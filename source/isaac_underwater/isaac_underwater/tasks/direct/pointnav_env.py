@@ -50,6 +50,8 @@ from isaac_underwater.navigation import (
     robust_forward_clearance,
     visual_feature_dim,
 )
+from isaac_underwater.navigation.exit_curriculum import ExitDistanceCurriculum
+from isaac_underwater.navigation.route_geometry import project_polyline, sample_polyline
 from isaac_underwater.physics import (
     CurrentField,
     CurrentProfileCfg,
@@ -186,6 +188,11 @@ class UnderwaterPointNavEnvCfg(DirectRLEnvCfg):
     collision_penalty = 20.0
     cave_contact_termination_enabled = False
     cave_spawn_yaw_jitter_rad = 0.0
+    navigation_curriculum_enabled = False
+    navigation_curriculum_initial_distance_m = 4.0
+    navigation_curriculum_window = 10
+    navigation_curriculum_success_threshold = 0.7
+    navigation_curriculum_growth = 1.5
 
     position_scale = 0.1
     linear_velocity_scale = 0.5
@@ -411,6 +418,22 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                     dtype=torch.float32,
                 ) * abs(scale)
         self._has_cave_route = self._cave_centerline is not None or self._multi_cave_centerlines is not None
+        self._exit_curriculum: ExitDistanceCurriculum | None = None
+        self._episode_route_reference_m = torch.zeros(self.num_envs, device=self.device)
+        self._episode_curriculum_frontier_m = torch.zeros(self.num_envs, device=self.device)
+        self._episode_navigation_horizon_steps = torch.full(
+            (self.num_envs,), self.max_episode_length, dtype=torch.long, device=self.device
+        )
+        if cfg.navigation_curriculum_enabled:
+            if self._multi_cave_centerlines is None:
+                raise ValueError("Exit-distance curriculum requires the multi-cave navigation task")
+            self._exit_curriculum = ExitDistanceCurriculum(
+                self._cave_scene_route_lengths,
+                initial_distance_m=float(cfg.navigation_curriculum_initial_distance_m),
+                window=int(cfg.navigation_curriculum_window),
+                success_threshold=float(cfg.navigation_curriculum_success_threshold),
+                growth=float(cfg.navigation_curriculum_growth),
+            )
 
         self._cave_portals: tuple[CavePortal, ...] = ()
         self._cave_portal_positions = torch.empty((0, 3), device=self.device)
@@ -674,6 +697,10 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             self.scene.sensors["contact"] = self._contact_sensor
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        # The runner consumes a log record on every step that includes this
+        # key.  Only _reset_idx should publish completed-episode statistics;
+        # retaining the last record would count it repeatedly until next reset.
+        self.extras.pop("log", None)
         self._actions = actions.clone().clamp(-1.0, 1.0)
         self._desired_velocity_b = self._actions[:, :3] * self._max_command_velocity
         self._desired_yaw_rate = self._actions[:, 3] * self.cfg.max_command_yaw_rate_radps
@@ -998,6 +1025,8 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             # unique voxels and workspace coverage rather than goal success.
             self._success.zero_()
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        if self._exit_curriculum is not None:
+            time_out |= self.episode_length_buf >= self._episode_navigation_horizon_steps - 1
         terminated = self._out_of_bounds | collision_termination
         if not bool(getattr(self.cfg, "cave_entry_enabled", False)) or bool(
             getattr(self.cfg, "cave_entry_terminate_on_success", True)
@@ -1027,18 +1056,15 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             assert self._multi_cave_clearances is not None
             centerlines = self._multi_cave_centerlines[self._cave_scene_ids]
             route_mask = self._multi_cave_route_mask[self._cave_scene_ids]
-            distances_sq = torch.sum(
-                (relative_pos.unsqueeze(1) - centerlines).square(), dim=-1
-            ).masked_fill(~route_mask, float("inf"))
-            nearest_distance_sq, nearest_index = distances_sq.min(dim=1)
             selected_chainages = self._multi_cave_chainages[self._cave_scene_ids]
             selected_clearances = self._multi_cave_clearances[self._cave_scene_ids]
-            self._cave_route_chainage = selected_chainages.gather(
-                1, nearest_index.unsqueeze(-1)
-            ).squeeze(-1)
-            self._cave_local_clearance = selected_clearances.gather(
-                1, nearest_index.unsqueeze(-1)
-            ).squeeze(-1)
+            self._cave_centerline_distance, self._cave_route_chainage, segment_index = project_polyline(
+                relative_pos, centerlines, selected_chainages, route_mask
+            )
+            self._cave_local_clearance = torch.minimum(
+                selected_clearances.gather(1, segment_index[:, None]).squeeze(1),
+                selected_clearances.gather(1, (segment_index + 1)[:, None]).squeeze(1),
+            )
         else:
             assert self._cave_centerline is not None and self._cave_chainage is not None
             distances_sq = torch.sum(
@@ -1050,7 +1076,7 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                 self._cave_local_clearance = self._cave_surface_clearance[nearest_index]
             else:
                 self._cave_local_clearance.fill_(float("inf"))
-        self._cave_centerline_distance = torch.sqrt(nearest_distance_sq.clamp_min(0.0))
+            self._cave_centerline_distance = torch.sqrt(nearest_distance_sq.clamp_min(0.0))
         self._cave_contact_force_n.zero_()
         if self._contact_sensor is not None:
             net_forces = self._contact_sensor.data.net_forces_w
@@ -1170,7 +1196,7 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             else:
                 self._last_episode_path_length_m[env_ids] = self._episode_path_length_m[env_ids]
             if self._multi_cave_centerlines is not None:
-                shortest_path = self._cave_scene_route_lengths[self._cave_scene_ids[env_ids]]
+                shortest_path = self._episode_route_reference_m[env_ids]
             elif self._cave_chainage is not None:
                 spawn_chainage = float(getattr(self.cfg.world, "spawn_chainage_m", 0.0))
                 goal_chainage = float(getattr(self.cfg.world, "goal_chainage_m", spawn_chainage))
@@ -1212,6 +1238,19 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             self.extras["episode_reference_path_m"] = self._last_episode_reference_path_m.clone()
             self.extras["episode_spl"] = self._last_episode_spl.clone()
             self.extras["episode_scene_id"] = self._cave_scene_ids.clone()
+            if self._exit_curriculum is not None:
+                completed_ids = env_ids[
+                    self.reset_buf[env_ids].bool() & (self.episode_length_buf[env_ids] > 0)
+                ]
+                self._exit_curriculum.record(
+                    self._cave_scene_ids[completed_ids],
+                    self._success[completed_ids],
+                    self._episode_curriculum_frontier_m[completed_ids],
+                )
+                for scene_id, scene in enumerate(self._cave_scene_variants):
+                    self.extras["log"][f"Curriculum/{scene.key}/distance_m"] = float(
+                        self._exit_curriculum.distance_m[scene_id]
+                    )
             if self._has_cave_route:
                 self.extras["log"]["Metrics/SPL"] = self._last_episode_spl[env_ids].mean().item()
                 self.extras["log"]["Metrics/path_length_m"] = (
@@ -1278,13 +1317,36 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         if self._multi_cave_centerlines is not None:
             scene_ids = self._cave_scene_ids[env_ids]
             spawn = self._cave_scene_spawn_points[scene_ids].clone()
+            spawn_route_chainage = self._cave_scene_spawn_chainages[scene_ids].clone()
+            tangent = self._cave_scene_spawn_tangents[scene_ids]
+            if self._exit_curriculum is not None:
+                frontier = self._exit_curriculum.distance_m[scene_ids]
+                self._episode_curriculum_frontier_m[env_ids] = frontier
+                spawn_route_chainage = self._cave_scene_goal_chainages[scene_ids] - frontier
+                spawn, tangent = sample_polyline(
+                    spawn_route_chainage,
+                    self._multi_cave_centerlines[scene_ids],
+                    self._multi_cave_chainages[scene_ids],
+                    self._multi_cave_route_mask[scene_ids],
+                )
+                horizon_s = (10.0 + 4.0 * frontier).clamp(max=float(self.cfg.episode_length_s))
+                self._episode_navigation_horizon_steps[env_ids] = torch.ceil(horizon_s / self.step_dt).long()
+            self._episode_route_reference_m[env_ids] = (
+                self._cave_scene_goal_chainages[scene_ids] - spawn_route_chainage
+            )
             jitter_scale = self._cave_scene_spawn_jitters[scene_ids].unsqueeze(-1)
             if bool(torch.any(jitter_scale > 0.0)):
                 spawn += torch.randn_like(spawn) * jitter_scale
             root_state[:, :3] = spawn + self.scene.env_origins[env_ids]
             self._goal_pos_w[env_ids] = self._cave_scene_goal_points[scene_ids] + self.scene.env_origins[env_ids]
-            spawn_route_chainage = self._cave_scene_spawn_chainages[scene_ids].clone()
-            tangent = self._cave_scene_spawn_tangents[scene_ids]
+            # Initialize progress at the jittered position, so the first
+            # reward does not count reset displacement as travelled distance.
+            _, spawn_route_chainage, _ = project_polyline(
+                spawn,
+                self._multi_cave_centerlines[scene_ids],
+                self._multi_cave_chainages[scene_ids],
+                self._multi_cave_route_mask[scene_ids],
+            )
             yaw = torch.atan2(tangent[:, 1], tangent[:, 0])
             yaw_jitter = float(getattr(self.cfg, "cave_spawn_yaw_jitter_rad", 0.0))
             if yaw_jitter > 0.0:
@@ -1964,7 +2026,9 @@ class UnderwaterMultiCaveNavigationEnvCfg(UnderwaterCaveVisualPilotEnvCfg):
     all environments update the same PPO actor/critic weights.
     """
 
-    episode_length_s = 180.0
+    # The privileged path follower needs ~172 s on the hard cave. Allow a
+    # learned policy additional time for cautious turns and recovery.
+    episode_length_s = 300.0
     goal_threshold_m = 1.0
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=6,
