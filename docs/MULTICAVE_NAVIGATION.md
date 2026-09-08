@@ -119,15 +119,40 @@ A first full experiment can use:
 
 ```bash
 MAX_ITERATIONS=2000 NUM_ENVS=6 NAVIGATION_CURRICULUM=1 \
-RUN_NAME=multicave_full \
+FULL_EVALUATION=1 RUN_NAME=multicave_full \
   ./scripts/run_multicave_navigation_rl_pipeline.sh
 ```
+
+`FULL_EVALUATION=1` follows the short wiring check with 30 complete episodes per
+scene from the real entrances and the acceptance gate. A nonzero exit at that
+gate means the saved policy is not accepted; it does not erase the training run.
+`EPISODES_PER_SCENE` changes the evaluation sample count, but the gate still
+requires at least 30. Resume a named checkpoint by also setting
+`RESUME_RUN=<run-directory-name> RESUME_CHECKPOINT=model_<iteration>.pt`;
+`MAX_ITERATIONS` then means additional PPO updates, as in upstream RSL-RL.
+The pipeline saves every `SAVE_INTERVAL=10` updates by default, including the
+per-scene curriculum state. Direct `scripts/train.py` runs can set
+`agent.save_interval=10` explicitly.
 
 Six environments give two copies of each train-all scene and match the three
 recurrent PPO minibatches. Increase environment count only in multiples of
 three and after checking RTX memory and steps/second. Domain randomization
 resamples dynamics, actuation, current, image degradation, IMU, and timing
 parameters per environment at reset.
+
+Short nominal probes on this RTX 4060 Laptop GPU also support larger batches:
+
+| Environments | Copies per cave | Aggregate transitions/s |
+| --- | ---: | ---: |
+| 12 | 4 | about 300 |
+| 24 | 8 | about 530 |
+| 48 | 16 | about 710 |
+
+The 48-env probe sampled about 4 GiB GPU memory, but its process also used about
+7.6 GiB host RAM. Check both memory pools before increasing parallelism. These
+are brief throughput measurements, not convergence or long-run stability claims.
+Increasing environment count also increases samples per PPO update; equal
+iteration counts are not equal training budgets.
 
 `NAVIGATION_CURRICULUM=1` enables a training-only reverse curriculum. Each cave
 starts 4 m from its exit. After at least 7 successes in a sliding window of 10
@@ -141,16 +166,25 @@ successes. The evaluator always disables the curriculum and uses true entrance
 spawns.
 
 The curriculum can also be enabled directly with `scripts/train.py
---navigation_curriculum`. Its frontier is environment state, not policy weights;
-resuming PPO currently restarts the curriculum unless a different
-`env.navigation_curriculum_initial_distance_m` is supplied. Start with nominal
+--navigation_curriculum`. New training checkpoints store each scene's frontier
+and promotion window alongside the PPO model and optimizer. Resume validates
+scene identities/order, route lengths, and curriculum settings before restoring
+the frontier and respawning. Legacy checkpoints without curriculum metadata emit
+a warning and use `env.navigation_curriculum_initial_distance_m` (default 4 m).
+This is a training-state resume, not a bit-exact simulator/RNG replay. Start with nominal
 conditions, then enable `DOMAIN_RANDOMIZATION=1` to assess learning under the
 configured dynamics and sensor variation.
+Curriculum episodes start with a zero episode clock: upstream's random initial
+clock can exceed the shorter curriculum horizon and otherwise inserts artificial
+one-step timeout failures into the promotion window after each restart.
 
 ## Balanced evaluation
 
 Use completed episodes per scene rather than a global episode count, otherwise
-short failure episodes can bias the aggregate toward one cave:
+short failure episodes can bias the aggregate toward one cave. The evaluator
+preassigns a nearly equal episode quota to every worker within each scene, so
+fast failure workers cannot consume slower workers' samples either. It records
+both assigned quotas and accepted per-worker counts in the JSON output:
 
 ```bash
 ./.venv/bin/python scripts/evaluate_ppo.py \
@@ -168,7 +202,12 @@ short failure episodes can bias the aggregate toward one cave:
 
 The default gate requires every selected scene to have at least 30 episodes,
 success rate at least 0.80, collision rate at most 0.15, and mean SPL at least
-0.50. These are initial engineering acceptance thresholds, not a scientific
+0.50. It resolves the profile's complete scene set from the dataset manifest,
+rejects missing/extra scenes and inconsistent episode counts, and requires
+`navigation_curriculum: false` explicitly. A short-distance curriculum result
+cannot pass as an entrance-to-exit evaluation. Run the CPU-only gate regressions
+with `./.venv/bin/python scripts/test_navigation_metrics.py`.
+These are initial engineering acceptance thresholds, not a scientific
 claim. Report per-scene values and confidence intervals for final experiments,
 and repeat evaluation with `--domain_randomization`.
 
@@ -213,6 +252,8 @@ The following contracts pass on the RTX 4060 workstation:
 - full collision-free reference-controller traversal of all three scenes;
 - nominal and forced-frame-drop domain-randomized visual observations;
 - one-update recurrent PPO training, checkpoint loading, and balanced metrics.
+- curriculum checkpoint save/restore in the actual simulator;
+- fixed per-worker evaluation quotas and strict complete-scene acceptance checks.
 
 The 100-update nominal baseline `2026-09-08_19-17-27_multicave_nominal_sanity_v2`
 completed 38,400 transitions after the contact-reset fix. Its full-route check
@@ -220,5 +261,11 @@ completed three episodes per scene with 0/9 successes, 2/9 collisions, and a
 mean travelled path of 3.81 m. This baseline used nearest-vertex progress and
 no curriculum. The evaluator clears recurrent memory between episodes;
 training episode logs now publish only when a new episode finishes.
+
+The resumed curriculum checkpoint `2026-09-08_23-29-24_multicave_resume12_to300_v1/model_299.pt`
+reached training frontiers of 20.25 / 13.5 / 20.25 m (easy / medium / hard).
+Its true-entrance check still returned **0/9 successes**, with 6/9 collisions and
+a mean travelled path of 5.86 m. Easy left the route bounds; medium and hard
+collided. The checkpoint is a training intermediate, not an accepted navigator.
 
 No converged checkpoint or held-out success result has been established.

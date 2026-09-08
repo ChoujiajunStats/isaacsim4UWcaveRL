@@ -52,8 +52,10 @@ sys.path.insert(0, str(TRAIN_SCRIPT.parent))
 
 import isaac_underwater.tasks  # noqa: E402,F401
 from isaac_underwater.learning import register_rsl_rl_extensions  # noqa: E402
+from isaac_underwater.learning.navigation_runner import register_navigation_runner  # noqa: E402
 
 register_rsl_rl_extensions()
+register_navigation_runner()
 
 
 if __name__ == "__main__":

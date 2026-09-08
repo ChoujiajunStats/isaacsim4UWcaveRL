@@ -71,6 +71,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 import isaac_underwater.tasks  # noqa: F401
 from isaac_underwater.learning import register_rsl_rl_extensions
+from isaac_underwater.navigation.evaluation_quota import SceneEpisodeQuota
 from isaac_underwater.tasks.direct.agents import make_runner_cfg
 from isaaclab.envs import DirectRLEnv
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
@@ -120,7 +121,6 @@ def main() -> None:
         if args.episodes_per_scene is not None
         else args.episodes
     )
-    scene_episode_counts = {scene_id: 0 for scene_id in range(len(variants))}
 
     print(f"ppo_eval: building {args.task} with {args.num_envs} environments", flush=True)
     env = gym.make(args.task, cfg=env_cfg)
@@ -134,6 +134,10 @@ def main() -> None:
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(str(args.checkpoint))
     policy = runner.get_inference_policy(device=vec_env.device)
+    episode_quota = (
+        SceneEpisodeQuota(env.unwrapped._cave_scene_ids.tolist(), len(variants), args.episodes_per_scene)
+        if args.episodes_per_scene is not None else None
+    )
 
     episode_returns = torch.zeros(vec_env.num_envs, device=vec_env.device)
     episode_lengths = torch.zeros(vec_env.num_envs, dtype=torch.long, device=vec_env.device)
@@ -159,6 +163,8 @@ def main() -> None:
             raise FloatingPointError(f"Non-finite policy output at rollout step {rollout_step}")
         episode_returns += rewards
         episode_lengths += 1
+        if rollout_step % 500 == 0:
+            print(f"ppo_eval: step={rollout_step} completed={len(completed_returns)}/{required_episodes}", flush=True)
         done_ids = dones.to(dtype=torch.bool).nonzero(as_tuple=False).flatten()
         if done_ids.numel() == 0:
             continue
@@ -202,12 +208,11 @@ def main() -> None:
         scene_ids = scene_id_buffer[done_ids].detach().cpu().tolist()
         returns = episode_returns[done_ids].detach().cpu().tolist()
         lengths = episode_lengths[done_ids].detach().cpu().tolist()
+        done_env_ids = done_ids.tolist()
         for index in range(len(returns)):
             scene_id = int(scene_ids[index])
-            if args.episodes_per_scene is not None:
-                if scene_id not in scene_episode_counts:
-                    raise RuntimeError(f"Task reported invalid cave scene id {scene_id}")
-                if scene_episode_counts[scene_id] >= args.episodes_per_scene:
+            if episode_quota is not None:
+                if not episode_quota.accept(done_env_ids[index], scene_id):
                     continue
             elif len(completed_returns) >= required_episodes:
                 break
@@ -223,8 +228,13 @@ def main() -> None:
             completed_reference_paths.append(float(reference_paths[index]))
             completed_spl.append(float(spl_values[index]))
             completed_scene_ids.append(scene_id)
-            if args.episodes_per_scene is not None:
-                scene_episode_counts[scene_id] += 1
+            scene_label = variants[scene_id].key if variants else str(scene_id)
+            print(
+                f"ppo_eval: episode={len(completed_returns)}/{required_episodes} scene={scene_label} "
+                f"success={bool(success[index])} collision={bool(collisions[index])} "
+                f"bounds={bool(bounds[index])} timeout={bool(timeouts[index])} "
+                f"steps={lengths[index]} path_m={path_lengths[index]:.2f}", flush=True,
+            )
         episode_returns[done_ids] = 0.0
         episode_lengths[done_ids] = 0
         # get_inference_policy() returns the bound act_inference method, not
@@ -248,6 +258,9 @@ def main() -> None:
         "num_envs": args.num_envs,
         "episodes": count,
         "episodes_per_scene": args.episodes_per_scene,
+        "episode_allocation": "fixed_balanced_per_environment" if episode_quota else "completion_order",
+        "episode_quotas": episode_quota.quotas if episode_quota else None,
+        "accepted_episodes_per_environment": episode_quota.counts if episode_quota else None,
         "rollout_steps": rollout_step,
         "seed": args.seed,
         "episode_length_s": float(env_cfg.episode_length_s),
@@ -290,8 +303,12 @@ def main() -> None:
                 "episodes": scene_count,
                 "success_rate": sum(completed_success[index] for index in sample_ids) / scene_count,
                 "collision_rate": sum(completed_collisions[index] for index in sample_ids) / scene_count,
+                "out_of_bounds_rate": sum(completed_bounds[index] for index in sample_ids) / scene_count,
+                "timeout_rate": sum(completed_timeouts[index] for index in sample_ids) / scene_count,
+                "mean_episode_length_steps": sum(completed_lengths[index] for index in sample_ids) / scene_count,
                 "mean_spl": sum(completed_spl[index] for index in sample_ids) / scene_count,
                 "mean_path_length_m": sum(completed_path_lengths[index] for index in sample_ids) / scene_count,
+                "mean_reference_path_length_m": sum(completed_reference_paths[index] for index in sample_ids) / scene_count,
             }
         per_difficulty = {}
         for difficulty, sample_ids in per_difficulty_samples.items():

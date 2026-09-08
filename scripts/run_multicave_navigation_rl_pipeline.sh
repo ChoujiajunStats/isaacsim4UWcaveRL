@@ -13,9 +13,14 @@ NUM_ENVS="${NUM_ENVS:-6}"
 SMOKE_ENVS="${SMOKE_ENVS:-3}"
 EVAL_ENVS="${EVAL_ENVS:-3}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-1}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 RUN_NAME="${RUN_NAME:-multicave_pipeline}"
 DOMAIN_RANDOMIZATION="${DOMAIN_RANDOMIZATION:-0}"
 NAVIGATION_CURRICULUM="${NAVIGATION_CURRICULUM:-0}"
+RESUME_RUN="${RESUME_RUN:-}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
+FULL_EVALUATION="${FULL_EVALUATION:-0}"
+EPISODES_PER_SCENE="${EPISODES_PER_SCENE:-30}"
 DATASET_CONFIG="${DATASET_CONFIG:-worlds/caves_difficulty_v01.yaml}"
 EXPERIMENT_ROOT="${PROJECT_ROOT}/logs/rsl_rl/underwater_cave_multinav"
 
@@ -51,11 +56,33 @@ case "${NAVIGATION_CURRICULUM,,}" in
   0|false|no|off) ;;
   *) echo "NAVIGATION_CURRICULUM must be 0/1 or false/true" >&2; exit 2 ;;
 esac
+if [[ -n "${RESUME_RUN}" || -n "${RESUME_CHECKPOINT}" ]]; then
+  if [[ -z "${RESUME_RUN}" || -z "${RESUME_CHECKPOINT}" ]]; then
+    echo "RESUME_RUN and RESUME_CHECKPOINT must be supplied together" >&2
+    exit 2
+  fi
+  TRAIN_ARGS+=(--resume --load_run "${RESUME_RUN}" --checkpoint "${RESUME_CHECKPOINT}")
+fi
+case "${FULL_EVALUATION,,}" in
+  1|true|yes|on) FULL_EVALUATION=1 ;;
+  0|false|no|off) FULL_EVALUATION=0 ;;
+  *) echo "FULL_EVALUATION must be 0/1 or false/true" >&2; exit 2 ;;
+esac
+if [[ ! "${EPISODES_PER_SCENE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "EPISODES_PER_SCENE must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SAVE_INTERVAL must be a positive integer" >&2
+  exit 2
+fi
 
 cd "${PROJECT_ROOT}"
 
-PYTHONPATH="${PROJECT_ROOT}/source/isaac_underwater${PYTHONPATH:+:${PYTHONPATH}}" \
-  "${PYTHON_BIN}" scripts/test_cave_dataset.py
+for contract in test_cave_dataset test_route_geometry test_navigation_metrics test_navigation_checkpoint test_navigation_evaluation; do
+  PYTHONPATH="${PROJECT_ROOT}/source/isaac_underwater${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${PYTHON_BIN}" "scripts/${contract}.py"
+done
 
 "${PYTHON_BIN}" scripts/convert_cave_asset.py \
   --config "${DATASET_CONFIG}" \
@@ -80,7 +107,8 @@ PYTHONPATH="${PROJECT_ROOT}/source/isaac_underwater${PYTHONPATH:+:${PYTHONPATH}}
   --run_name "${RUN_NAME}" \
   --headless \
   --enable_cameras \
-  --device "${DEVICE}"
+  --device "${DEVICE}" \
+  "agent.save_interval=${SAVE_INTERVAL}"
 
 RUN_DIR="$(find "${EXPERIMENT_ROOT}" -mindepth 1 -maxdepth 1 -type d \
   -name "*_${RUN_NAME}" -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
@@ -125,3 +153,16 @@ echo "multi-cave navigation RL pipeline complete (wiring gate only)"
 echo "profile=${PROFILE}"
 echo "checkpoint=${CHECKPOINT}"
 echo "contract_metrics=${METRICS}"
+
+if (( FULL_EVALUATION )); then
+  FULL_METRICS="${RUN_DIR}/evaluation_full.json"
+  "${PYTHON_BIN}" scripts/evaluate_ppo.py \
+    --task "${TASK}" --checkpoint "${CHECKPOINT}" \
+    --cave_dataset_profile "${PROFILE}" "${DOMAIN_ARGS[@]}" \
+    --num_envs "${EVAL_ENVS}" --episodes_per_scene "${EPISODES_PER_SCENE}" \
+    --max_rollout_steps "$(( EPISODES_PER_SCENE * 6000 + 100 ))" \
+    --output "${FULL_METRICS}" --headless --device "${DEVICE}"
+  "${PYTHON_BIN}" scripts/check_navigation_metrics.py \
+    "${FULL_METRICS}" --expected-profile "${PROFILE}"
+  echo "multi-cave full-route acceptance complete: ${FULL_METRICS}"
+fi
