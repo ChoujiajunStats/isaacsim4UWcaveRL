@@ -1,0 +1,21 @@
+runner:
+  num_steps_per_env: 24
+  max_iterations: 500
+  save_interval: 25
+  seed: 42
+network:
+  actor_hidden_dims: [128, 128]
+  critic_hidden_dims: [128, 128]
+  activation: elu
+  init_noise_std: 0.8
+algorithm:
+  learning_rate: 0.0005
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  gamma: 0.99
+  lambda: 0.95
+  clip_param: 0.2
+  entropy_coef: 0.002
+  value_loss_coef: 1.0
+  desired_kl: 0.01
+  max_grad_norm: 1.0

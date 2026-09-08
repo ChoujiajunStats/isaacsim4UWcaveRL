@@ -57,5 +57,7 @@ TERM=xterm-256color VIRTUAL_ENV="${venv_dir}" PATH="${venv_dir}/bin:${PATH}" \
 uv pip install --python "${venv_dir}/bin/python" \
     psutil==5.9.8 typing-extensions==4.12.2 \
     'ipython<9' onnx==1.18.0 wheel==0.43.0
+uv pip install --python "${venv_dir}/bin/python" --editable \
+    "${project_root}/source/isaac_underwater"
 
 echo "Isaac Sim and Isaac Lab installation complete."

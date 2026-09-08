@@ -9,6 +9,7 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--task", default="Isaac-Underwater-PointNav-Direct-v0")
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--steps", type=int, default=200)
 parser.add_argument("--episode_log_path", type=str, default=None)
@@ -30,7 +31,7 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 def main() -> None:
     cfg = parse_env_cfg(
-        "Isaac-Underwater-PointNav-Direct-v0",
+        args.task,
         device=args.device,
         num_envs=args.num_envs,
     )
@@ -43,7 +44,7 @@ def main() -> None:
     if args.hydrodynamics_preset is not None:
         cfg.hydrodynamics_preset = args.hydrodynamics_preset
     cfg.domain_randomization_enabled = args.domain_randomization
-    env = gym.make("Isaac-Underwater-PointNav-Direct-v0", cfg=cfg)
+    env = gym.make(args.task, cfg=cfg)
     obs, _ = env.reset()
     initial_position = env.unwrapped._robot.data.root_pos_w.clone()
     for _ in range(args.steps):

@@ -1,0 +1,13 @@
+backend: external_vio
+transport: in_process_adapter
+timestamp_tolerance_s: 0.0001
+example_adapter: scripts/vio_dead_reckoning.py
+example_adapter_note: contract-only IMU dead reckoning; not visual-inertial odometry
+health_fields:
+  - tracking_status
+  - feature_count
+  - track_lifetime_s
+  - spatial_coverage
+  - covariance
+  - innovation_norm
+  - relocalization_event

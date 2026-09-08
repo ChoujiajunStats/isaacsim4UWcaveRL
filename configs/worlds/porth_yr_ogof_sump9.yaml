@@ -1,0 +1,18 @@
+name: porth_yr_ogof_sump9
+asset_root_env: ISAAC_UNDERWATER_ASSET_ROOT
+asset_root_default: /home/kenton/Downloads/assets
+visual_source: converted/porth_yr_ogof_sump9_visual.obj
+collision_source: collision/porth_yr_ogof_sump9_collision.obj
+metadata: metadata/porth_yr_ogof_sump9.yaml
+centerline: metadata/porth_yr_ogof_sump9_navigation_centerline.csv
+asset_scale: 1.0
+asset_translation_m: [0.0, 0.0, 0.0]
+asset_orientation_wxyz: [1.0, 0.0, 0.0, 0.0]
+spawn_chainage_m: 2.0
+goal_chainage_m: 20.0
+spawn_jitter_m: 0.0
+navigation_workspace_size_m: [110.0, 50.0, 8.0]
+scale_status: provisional_engineering_smoke_only
+candidate_status: provisional_requires_human_review
+clone_per_env: true
+visual_enabled: true

@@ -1,0 +1,29 @@
+{
+  "samples": 10000,
+  "preset": "hydro_rl",
+  "mass_eigenvalues": [
+    0.6166667342185974,
+    1.2966667413711548,
+    1.6033333539962769,
+    22.0,
+    23.0,
+    24.0
+  ],
+  "max_mass_symmetry_error": 0.0,
+  "max_coriolis_energy_abs": 4.336237907409668e-05,
+  "min_damping_power": 0.7850973010063171,
+  "max_wrench_power": -0.7850973606109619,
+  "checks": {
+    "mass_matrix_symmetry": true,
+    "mass_matrix_positive_definite": true,
+    "coriolis_energy_property": true,
+    "damping_dissipation_matrix": true,
+    "damping_wrench_dissipation": true,
+    "finite_values": true,
+    "zero_relative_current_drag": true,
+    "stationary_current_force_direction": true,
+    "roll_restoring_direction": true,
+    "pitch_restoring_direction": true
+  },
+  "status": "PASS"
+}

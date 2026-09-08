@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 import math
 from collections.abc import Sequence
+from pathlib import Path
 
 import gymnasium as gym
 import torch
@@ -12,7 +14,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import Imu, ImuCfg, TiledCamera, TiledCameraCfg
+from isaaclab.sensors import ContactSensor, ContactSensorCfg, Imu, ImuCfg, TiledCamera, TiledCameraCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
 
@@ -22,7 +24,10 @@ from isaac_underwater.appearance import (
     UnderwaterLightingCfg,
     VehicleLightCfg,
     apply_underwater_appearance,
+    bluerov2_candidate_lighting,
+    coerce_lighting_cfg,
     spawn_underwater_lighting,
+    update_underwater_lighting_batch,
 )
 from isaac_underwater.config import load_config
 from isaac_underwater.controllers import VelocityController, command_to_thruster
@@ -33,9 +38,16 @@ from isaac_underwater.localization import (
 )
 from isaac_underwater.logging import EpisodeJsonlLogger
 from isaac_underwater.navigation import (
+    CavePortal,
     PolicyStateSource,
+    VoxelVisitTracker,
     build_navigation_observation,
+    build_visual_observation,
+    infer_clearance_portals,
+    interpolate_polyline,
     navigation_observation_to_tensor,
+    robust_forward_clearance,
+    visual_feature_dim,
 )
 from isaac_underwater.physics import CurrentField, CurrentProfileCfg, Hydrodynamics, HydrodynamicsCfg, rotate_world_to_body
 from isaac_underwater.randomization import (
@@ -46,7 +58,7 @@ from isaac_underwater.randomization import (
 )
 from isaac_underwater.robot import make_underwater_robot_cfg, spawn_bluerov2_visual
 from isaac_underwater.sensors import SensorSuiteCfg
-from isaac_underwater.worlds import OpenWaterWorldCfg, spawn_open_water_world
+from isaac_underwater.worlds import CaveWorldCfg, OpenWaterWorldCfg, load_cave_world_cfg, spawn_open_water_world
 
 
 @configclass
@@ -81,7 +93,10 @@ class UnderwaterPointNavEnvCfg(DirectRLEnvCfg):
     )
     robot: RigidObjectCfg = make_underwater_robot_cfg(load_config("robot.yaml"))
     camera_sensor: TiledCameraCfg | None = None
+    camera_left_sensor: TiledCameraCfg | None = None
+    camera_right_sensor: TiledCameraCfg | None = None
     imu_sensor: ImuCfg | None = None
+    contact_sensor: ContactSensorCfg | None = None
     lighting: UnderwaterLightingCfg = UnderwaterLightingCfg()
     appearance: UnderwaterAppearanceCfg = UnderwaterAppearanceCfg()
     world: OpenWaterWorldCfg = OpenWaterWorldCfg()
@@ -105,6 +120,55 @@ class UnderwaterPointNavEnvCfg(DirectRLEnvCfg):
     episode_log_path: str | None = None
     domain_randomization_enabled = False
     detailed_robot_visual = True
+    light_control_enabled = False
+    light_control_channels = 0
+    light_control_default_scale = 1.0
+    visual_observation_enabled = False
+    visual_output_hw = (12, 16)
+    visual_max_depth_m = 12.0
+    visual_mission_command_enabled = True
+
+    # Label-free exploration is a separate task contract.  The visitation
+    # grid and GT pose are privileged reward/critic inputs and are never
+    # included in the deployed actor observation.
+    exploration_reward_enabled = False
+    exploration_voxel_size_m = 0.5
+    exploration_new_voxel_reward = 1.0
+    exploration_revisit_penalty = 0.002
+    exploration_clearance_margin_m = 0.8
+    exploration_clearance_penalty_weight = 2.0
+    exploration_depth_crop_fraction = 0.5
+    exploration_depth_quantile = 0.1
+    exploration_random_yaw = False
+
+    # Optional geometry-derived entry curriculum.  Portal candidates come
+    # from an automatic surface-clearance transition at a skeleton endpoint,
+    # never from a hand-authored entrance coordinate or actor command.
+    cave_entry_enabled = False
+    cave_entry_minimum_clearance_m = 0.65
+    cave_entry_minimum_exterior_run_m = 1.0
+    cave_entry_tangent_probe_m = 1.5
+    cave_entry_spawn_distance_range_m = (1.5, 2.5)
+    cave_entry_spawn_lateral_jitter_m = 0.10
+    cave_entry_spawn_vertical_jitter_m = 0.05
+    cave_entry_gate_radius_m = 1.5
+    cave_entry_depth_m = 0.75
+    cave_entry_bonus = 25.0
+    cave_entry_terminate_on_success = True
+
+    # Cave route/contact terms are inactive for open-water tasks.  They are
+    # explicit configuration so their provisional status is visible in logs.
+    cave_route_reward_enabled = False
+    route_progress_weight = 2.0
+    route_deviation_penalty_weight = 0.5
+    route_deviation_soft_m = 0.75
+    route_deviation_hard_m = 3.0
+    centerline_clearance_penalty_weight = 1.0
+    vehicle_bounding_radius_m = 0.5
+    clearance_margin_m = 0.05
+    collision_force_threshold_n = 5.0
+    collision_penalty = 20.0
+    cave_contact_termination_enabled = False
 
     position_scale = 0.1
     linear_velocity_scale = 0.5
@@ -120,20 +184,58 @@ class UnderwaterPointNavEnv(DirectRLEnv):
     cfg: UnderwaterPointNavEnvCfg
 
     def __init__(self, cfg: UnderwaterPointNavEnvCfg, render_mode: str | None = None, **kwargs):
+        # Hydra recursively updates plain dataclass tuples as mappings.  Coerce
+        # that representation before Isaac scene setup consumes the light list.
+        cfg.lighting = coerce_lighting_cfg(cfg.lighting)
         self._camera: TiledCamera | None = None
+        self._camera_left: TiledCamera | None = None
+        self._camera_right: TiledCamera | None = None
         self._imu: Imu | None = None
+        self._contact_sensor: ContactSensor | None = None
+        self._light_prims_by_env: list[list[object]] = []
         self._last_control_command: ControlCommand | None = None
         self._last_thruster_command: torch.Tensor | None = None
         self._last_localization: LocalizationOutput | None = None
         super().__init__(cfg, render_mode, **kwargs)
 
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
+        light_channels = int(getattr(cfg, "light_control_channels", 0))
+        if bool(getattr(cfg, "light_control_enabled", False)) and light_channels <= 0:
+            light_channels = len(cfg.lighting.vehicle_lights)
+        self._light_intensity_scale = torch.full(
+            (self.num_envs, light_channels),
+            float(getattr(cfg, "light_control_default_scale", 1.0)),
+            device=self.device,
+        )
         self._desired_velocity_b = torch.zeros(self.num_envs, 3, device=self.device)
         self._desired_yaw_rate = torch.zeros(self.num_envs, device=self.device)
         self._goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
         self._previous_distance = torch.zeros(self.num_envs, device=self.device)
         self._success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._out_of_bounds = torch.zeros_like(self._success)
+        self._cave_collision = torch.zeros_like(self._success)
+        self._episode_had_collision = torch.zeros_like(self._success)
+        self._cave_contact_force_n = torch.zeros(self.num_envs, device=self.device)
+        # Keep terminal causes across DirectRLEnv's immediate reset.  The
+        # policy runner only needs ``log`` scalars, while finite evaluators
+        # need per-environment episode outcomes after ``step`` returns.
+        self._last_episode_success = torch.zeros_like(self._success)
+        self._last_episode_out_of_bounds = torch.zeros_like(self._success)
+        self._last_episode_timeout = torch.zeros_like(self._success)
+        self._last_episode_collision = torch.zeros_like(self._success)
+        self._last_episode_workspace_coverage = torch.zeros(self.num_envs, device=self.device)
+        self._last_episode_unique_voxels = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._last_episode_path_length_m = torch.zeros(self.num_envs, device=self.device)
+        self._exploration_forward_clearance_m = torch.full(
+            (self.num_envs,), float(cfg.visual_max_depth_m), device=self.device
+        )
+        self._cave_entry_portal_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cave_entry_signed_depth_m = torch.zeros(self.num_envs, device=self.device)
+        self._cave_entry_radial_distance_m = torch.zeros(self.num_envs, device=self.device)
+        self._cave_entry_event = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._episode_entered_cave = torch.zeros_like(self._cave_entry_event)
         self._max_command_velocity = torch.tensor(cfg.max_command_velocity_mps, device=self.device)
         self._localization_backend = (
             ExternalVIOBackend()
@@ -216,8 +318,99 @@ class UnderwaterPointNavEnv(DirectRLEnv):
 
         self._episode_sums = {
             key: torch.zeros(self.num_envs, device=self.device)
-            for key in ("progress", "goal", "heading", "action", "bounds")
+            for key in (
+                "progress",
+                "goal",
+                "heading",
+                "action",
+                "bounds",
+                "route_progress",
+                "route_deviation",
+                "clearance",
+                "collision",
+                "exploration",
+                "exploration_clearance",
+                "cave_entry",
+            )
         }
+        self._cave_centerline: torch.Tensor | None = None
+        self._cave_chainage: torch.Tensor | None = None
+        self._cave_surface_clearance: torch.Tensor | None = None
+        self._cave_centerline_distance = torch.zeros(self.num_envs, device=self.device)
+        self._cave_route_chainage = torch.zeros(self.num_envs, device=self.device)
+        self._previous_cave_route_chainage = torch.zeros(self.num_envs, device=self.device)
+        self._cave_local_clearance = torch.full((self.num_envs,), float("inf"), device=self.device)
+        centerline_path = getattr(self.cfg.world, "centerline_path", None)
+        if centerline_path:
+            rows = list(csv.DictReader(Path(centerline_path).open(encoding="utf-8")))
+            required = ("chainage_m", "north_m", "east_m", "down_m")
+            if not rows or any(field not in rows[0] for field in required):
+                raise ValueError(f"Cave centerline must contain columns {required}: {centerline_path}")
+            self._cave_chainage = torch.tensor(
+                [float(row["chainage_m"]) for row in rows], device=self.device, dtype=torch.float32
+            )
+            self._cave_centerline = torch.tensor(
+                [[float(row[axis]) for axis in ("north_m", "east_m", "down_m")] for row in rows],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if "nominal_surface_clearance_m" in rows[0]:
+                self._cave_surface_clearance = torch.tensor(
+                    [float(row["nominal_surface_clearance_m"]) for row in rows],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            if self._cave_centerline.shape[0] < 2:
+                raise ValueError("Cave centerline needs at least two points")
+
+        self._cave_portals: tuple[CavePortal, ...] = ()
+        self._cave_portal_positions = torch.empty((0, 3), device=self.device)
+        self._cave_portal_directions = torch.empty((0, 3), device=self.device)
+        self._cave_portal_chainages = torch.empty(0, device=self.device)
+        self._cave_portal_chainage_directions = torch.empty(0, device=self.device)
+        if bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            if self._cave_centerline is None or self._cave_chainage is None:
+                raise ValueError("Cave entry curriculum requires a geometry-derived centerline")
+            if self._cave_surface_clearance is None:
+                raise ValueError("Cave entry curriculum requires nominal_surface_clearance_m")
+            self._cave_portals = infer_clearance_portals(
+                self._cave_centerline,
+                self._cave_chainage,
+                self._cave_surface_clearance,
+                minimum_clearance_m=float(self.cfg.cave_entry_minimum_clearance_m),
+                minimum_exterior_run_m=float(self.cfg.cave_entry_minimum_exterior_run_m),
+                tangent_probe_m=float(self.cfg.cave_entry_tangent_probe_m),
+            )
+            if not self._cave_portals:
+                raise ValueError(
+                    "No automatic cave portal passed the exterior-run and clearance requirements"
+                )
+            self._cave_portal_positions = torch.stack(
+                [portal.position_m for portal in self._cave_portals]
+            )
+            self._cave_portal_directions = torch.stack(
+                [portal.inward_direction for portal in self._cave_portals]
+            )
+            self._cave_portal_chainages = torch.tensor(
+                [portal.chainage_m for portal in self._cave_portals],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._cave_portal_chainage_directions = torch.tensor(
+                [1.0 if portal.endpoint == "start" else -1.0 for portal in self._cave_portals],
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        self._exploration_tracker: VoxelVisitTracker | None = None
+        if bool(getattr(self.cfg, "exploration_reward_enabled", False)):
+            workspace = getattr(self.cfg.world, "navigation_workspace_size_m", None) or self.cfg.workspace_size_m
+            self._exploration_tracker = VoxelVisitTracker(
+                self.num_envs,
+                workspace,
+                float(self.cfg.exploration_voxel_size_m),
+                self.device,
+            )
 
     def submit_localization_output(self, output: LocalizationOutput, namespace: str | None = None) -> None:
         """Inject an external VIO estimate when the policy state source is VIO."""
@@ -234,13 +427,20 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             spawn_bluerov2_visual("/World/envs/env_0/Robot")
         if self.cfg.camera_sensor is not None:
             self._camera = TiledCamera(self.cfg.camera_sensor)
+        if self.cfg.camera_left_sensor is not None:
+            self._camera_left = TiledCamera(self.cfg.camera_left_sensor)
+        if self.cfg.camera_right_sensor is not None:
+            self._camera_right = TiledCamera(self.cfg.camera_right_sensor)
         if self.cfg.imu_sensor is not None:
             self._imu = Imu(self.cfg.imu_sensor)
+        if self.cfg.contact_sensor is not None:
+            self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         spawn_underwater_lighting(
             self.cfg.lighting,
             include_vehicle_lights=not self.cfg.scene.clone_in_fabric,
         )
-        spawn_open_water_world(self.cfg.world, root_path="/World", seabed_path="/World/seabed")
+        world_root = "/World/envs/env_0" if self.cfg.world.clone_per_env else "/World"
+        spawn_open_water_world(self.cfg.world, root_path=world_root, seabed_path="/World/seabed")
         self.scene.clone_environments(copy_from_source=False)
         if self.cfg.lighting.enabled and self.cfg.scene.clone_in_fabric:
             for env_index in range(self.num_envs):
@@ -250,18 +450,62 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                     robot_path=f"/World/envs/env_{env_index}/Robot",
                     include_ambient=False,
                 )
+        stage = sim_utils.get_current_stage()
+        self._light_prims_by_env = []
+        for env_index in range(self.num_envs):
+            env_prims = []
+            for light in self.cfg.lighting.vehicle_lights:
+                prim = stage.GetPrimAtPath(f"/World/envs/env_{env_index}/Robot/{light.name}")
+                if prim.IsValid():
+                    env_prims.append(prim)
+            self._light_prims_by_env.append(env_prims)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=["/World/seabed"])
         self.scene.rigid_objects["robot"] = self._robot
         if self._camera is not None:
             self.scene.sensors["camera"] = self._camera
+        if self._camera_left is not None:
+            self.scene.sensors["camera_left"] = self._camera_left
+        if self._camera_right is not None:
+            self.scene.sensors["camera_right"] = self._camera_right
         if self._imu is not None:
             self.scene.sensors["imu"] = self._imu
+        if self._contact_sensor is not None:
+            self.scene.sensors["contact"] = self._contact_sensor
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._actions = actions.clone().clamp(-1.0, 1.0)
         self._desired_velocity_b = self._actions[:, :3] * self._max_command_velocity
         self._desired_yaw_rate = self._actions[:, 3] * self.cfg.max_command_yaw_rate_radps
+        if self._light_intensity_scale.shape[1] > 0:
+            expected = 4 + self._light_intensity_scale.shape[1]
+            if self._actions.shape[1] < expected:
+                raise ValueError(f"Expected at least {expected} action dimensions for active-light control")
+            self._light_intensity_scale.copy_((self._actions[:, 4:expected] + 1.0) * 0.5)
+            self._update_light_prims()
+
+    def set_light_intensity_scale(self, intensity_scale: torch.Tensor) -> None:
+        """Set independent per-environment light scales in ``[0, 1]``."""
+        if self._light_intensity_scale.shape[1] == 0:
+            raise RuntimeError("This task has no active-light control channels")
+        scale = torch.as_tensor(intensity_scale, dtype=torch.float32, device=self.device)
+        if scale.shape != self._light_intensity_scale.shape:
+            raise ValueError(
+                f"Expected light scale shape {tuple(self._light_intensity_scale.shape)}, "
+                f"got {tuple(scale.shape)}"
+            )
+        self._light_intensity_scale.copy_(scale.clamp(0.0, 1.0))
+        self._update_light_prims()
+
+    def _update_light_prims(self) -> None:
+        if not self._light_prims_by_env or self._light_intensity_scale.shape[1] == 0:
+            return
+        update_underwater_lighting_batch(
+            self._light_prims_by_env,
+            self.cfg.lighting,
+            time_s=float(self.common_step_counter * self.step_dt),
+            intensity_scales=self._light_intensity_scale,
+        )
 
     def _apply_action(self) -> None:
         timestamp_s = float(self.common_step_counter * self.step_dt)
@@ -371,9 +615,100 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             linear_velocity_scale=self.cfg.linear_velocity_scale,
             angular_velocity_scale=self.cfg.angular_velocity_scale,
         )
-        return {"policy": obs}
+        if not getattr(self.cfg, "visual_observation_enabled", False):
+            return {"policy": obs}
+
+        packets = self.build_sensor_packets()
+        required = ("rgb_left", "rgb_right", "depth_left", "depth_right")
+        if any(any(getattr(packet, name) is None for name in required) for packet in packets):
+            raise RuntimeError("Visual observation requires synchronized stereo RGB/depth packets")
+
+        stack = lambda name: torch.stack([getattr(packet, name) for packet in packets], dim=0)
+        mission_command = (
+            obs[:, :4]
+            if bool(getattr(self.cfg, "visual_mission_command_enabled", True))
+            else None
+        )
+        visual = build_visual_observation(
+            stack("rgb_left"),
+            stack("rgb_right"),
+            stack("depth_left"),
+            stack("depth_right"),
+            imu_acceleration=None
+            if any(packet.imu_acceleration is None for packet in packets)
+            else stack("imu_acceleration"),
+            imu_angular_velocity=None
+            if any(packet.imu_angular_velocity is None for packet in packets)
+            else stack("imu_angular_velocity"),
+            pressure_depth_m=stack("pressure_depth_m"),
+            previous_action=self._actions,
+            # The goal-conditioned pilot receives the first four navigation
+            # values.  The exploration task explicitly passes ``None`` so its
+            # actor cannot infer a route or entrance label from a goal vector.
+            mission_command=mission_command,
+            output_hw=tuple(getattr(self.cfg, "visual_output_hw", (12, 16))),
+            max_depth_m=float(getattr(self.cfg, "visual_max_depth_m", 12.0)),
+        )
+        expected_dim = int(self.cfg.observation_space)
+        if visual.shape[-1] != expected_dim:
+            raise RuntimeError(f"Visual feature dimension mismatch: {visual.shape[-1]} != {expected_dim}")
+        critic = (
+            self._exploration_critic_observation(obs, ground_truth)
+            if bool(getattr(self.cfg, "exploration_reward_enabled", False))
+            else obs
+        )
+        return {"policy": visual, "critic": critic}
+
+    def _exploration_critic_observation(
+        self,
+        navigation_tensor: torch.Tensor,
+        ground_truth: GroundTruthState,
+    ) -> torch.Tensor:
+        """Build privileged state without a goal or centerline coordinate."""
+        workspace = getattr(self.cfg.world, "navigation_workspace_size_m", None) or self.cfg.workspace_size_m
+        half_workspace = 0.5 * torch.tensor(workspace, dtype=torch.float32, device=self.device)
+        relative_position = ground_truth.position_w - self.scene.env_origins
+        normalized_position = (relative_position / half_workspace.clamp_min(1.0e-6)).clamp(-2.0, 2.0)
+        if self._exploration_tracker is None:
+            workspace_coverage = torch.zeros((self.num_envs, 1), device=self.device)
+        else:
+            workspace_coverage = self._exploration_tracker.workspace_coverage_fraction.unsqueeze(-1)
+        normalized_clearance = (
+            self._exploration_forward_clearance_m / float(self.cfg.visual_max_depth_m)
+        ).clamp(0.0, 1.0).unsqueeze(-1)
+        normalized_contact = (
+            self._cave_contact_force_n / max(float(self.cfg.collision_force_threshold_n), 1.0e-6)
+        ).clamp(0.0, 10.0).unsqueeze(-1)
+        # navigation_tensor[4:] contains body velocities, projected gravity,
+        # and the previous action.  Its goal direction/distance are omitted.
+        features = [
+            normalized_position,
+            navigation_tensor[:, 4:],
+            workspace_coverage,
+            normalized_clearance,
+            normalized_contact,
+        ]
+        if bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            distance_scale = max(
+                float(self.cfg.cave_entry_spawn_distance_range_m[1]),
+                float(self.cfg.cave_entry_depth_m),
+                1.0e-6,
+            )
+            gate_scale = max(float(self.cfg.cave_entry_gate_radius_m), 1.0e-6)
+            features.append(
+                torch.stack(
+                    (
+                        (self._cave_entry_signed_depth_m / distance_scale).clamp(-2.0, 2.0),
+                        (self._cave_entry_radial_distance_m / gate_scale).clamp(0.0, 2.0),
+                        self._episode_entered_cave.float(),
+                    ),
+                    dim=-1,
+                )
+            )
+        return torch.cat(features, dim=-1)
 
     def _get_rewards(self) -> torch.Tensor:
+        self._refresh_cave_metrics()
         goal_vector_b = rotate_world_to_body(
             self._robot.data.root_quat_w,
             self._goal_pos_w - self._robot.data.root_pos_w,
@@ -388,7 +723,45 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             "heading": self.cfg.heading_weight * heading,
             "action": -self.cfg.action_penalty_weight * self._actions.square().sum(dim=-1),
             "bounds": -self.cfg.out_of_bounds_penalty * self._out_of_bounds.float(),
+            "route_progress": torch.zeros_like(progress),
+            "route_deviation": torch.zeros_like(progress),
+            "clearance": torch.zeros_like(progress),
+            "collision": torch.zeros_like(progress),
+            "exploration": torch.zeros_like(progress),
+            "exploration_clearance": torch.zeros_like(progress),
+            "cave_entry": torch.zeros_like(progress),
         }
+        if self._cave_centerline is not None and getattr(self.cfg, "cave_route_reward_enabled", False):
+            route_progress = self._cave_route_chainage - self._previous_cave_route_chainage
+            self._previous_cave_route_chainage = self._cave_route_chainage.detach().clone()
+            route_deviation = torch.relu(self._cave_centerline_distance - float(self.cfg.route_deviation_soft_m))
+            clearance_required = float(self.cfg.vehicle_bounding_radius_m) + float(self.cfg.clearance_margin_m)
+            # A missing/NaN clearance annotation is deliberately neutral.  It
+            # must not silently become a false safety signal.
+            clearance_risk = torch.where(
+                torch.isfinite(self._cave_local_clearance),
+                torch.relu(clearance_required - self._cave_local_clearance),
+                torch.zeros_like(progress),
+            )
+            rewards["route_progress"] = float(self.cfg.route_progress_weight) * route_progress
+            rewards["route_deviation"] = -float(self.cfg.route_deviation_penalty_weight) * route_deviation.square()
+            rewards["clearance"] = -float(self.cfg.centerline_clearance_penalty_weight) * clearance_risk.square()
+            rewards["collision"] = -float(self.cfg.collision_penalty) * self._cave_collision.float()
+        if self._exploration_tracker is not None:
+            rewards["exploration"] = (
+                float(self.cfg.exploration_new_voxel_reward) * self._exploration_tracker.new_voxel.float()
+                - float(self.cfg.exploration_revisit_penalty)
+                * (~self._exploration_tracker.new_voxel & self._exploration_tracker.position_valid).float()
+            )
+            clearance_risk = torch.relu(
+                float(self.cfg.exploration_clearance_margin_m) - self._exploration_forward_clearance_m
+            )
+            rewards["exploration_clearance"] = (
+                -float(self.cfg.exploration_clearance_penalty_weight) * clearance_risk.square()
+            )
+            rewards["collision"] = -float(self.cfg.collision_penalty) * self._cave_collision.float()
+        if bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            rewards["cave_entry"] = float(self.cfg.cave_entry_bonus) * self._cave_entry_event.float()
         for key, value in rewards.items():
             self._episode_sums[key] += value
         total_reward = torch.stack(tuple(rewards.values())).sum(dim=0)
@@ -396,19 +769,163 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        self._refresh_cave_metrics()
+        self._refresh_exploration_metrics()
+        self._refresh_cave_entry_metrics()
         relative_pos = self._robot.data.root_pos_w - self.scene.env_origins
-        half_x = self.cfg.workspace_size_m[0] * 0.5
-        half_y = self.cfg.workspace_size_m[1] * 0.5
-        self._out_of_bounds = (
-            (relative_pos[:, 0].abs() > half_x)
-            | (relative_pos[:, 1].abs() > half_y)
-            | (relative_pos[:, 2] < 0.25)
-            | (relative_pos[:, 2] > self.cfg.workspace_size_m[2])
-        )
-        distance = torch.linalg.vector_norm(self._goal_pos_w - self._robot.data.root_pos_w, dim=-1)
-        self._success = distance < self.cfg.goal_threshold_m
+        workspace = getattr(self.cfg.world, "navigation_workspace_size_m", None) or self.cfg.workspace_size_m
+        half_x, half_y, half_z = (float(value) * 0.5 for value in workspace)
+        self._out_of_bounds = (relative_pos[:, 0].abs() > half_x) | (relative_pos[:, 1].abs() > half_y)
+        if self._cave_centerline is None:
+            self._out_of_bounds |= (relative_pos[:, 2] < 0.25) | (relative_pos[:, 2] > float(workspace[2]))
+        else:
+            self._out_of_bounds |= relative_pos[:, 2].abs() > half_z
+        collision_termination = torch.zeros_like(self._cave_collision)
+        if self._cave_centerline is not None and getattr(self.cfg, "cave_route_reward_enabled", False):
+            self._out_of_bounds |= self._cave_centerline_distance > float(self.cfg.route_deviation_hard_m)
+            if getattr(self.cfg, "cave_contact_termination_enabled", False):
+                collision_termination |= self._cave_collision
+        if bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            if getattr(self.cfg, "cave_contact_termination_enabled", False):
+                collision_termination |= self._cave_collision
+            self._success.copy_(self._episode_entered_cave)
+        elif self._exploration_tracker is None:
+            distance = torch.linalg.vector_norm(self._goal_pos_w - self._robot.data.root_pos_w, dim=-1)
+            self._success = distance < self.cfg.goal_threshold_m
+        else:
+            # Coverage has no single privileged goal pose.  Evaluation uses
+            # unique voxels and workspace coverage rather than goal success.
+            self._success.zero_()
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return self._out_of_bounds | self._success, time_out
+        terminated = self._out_of_bounds | collision_termination
+        if not bool(getattr(self.cfg, "cave_entry_enabled", False)) or bool(
+            getattr(self.cfg, "cave_entry_terminate_on_success", True)
+        ):
+            terminated |= self._success
+        return terminated, time_out
+
+    def _refresh_cave_metrics(self) -> None:
+        """Update route/contact metrics with batched tensors.
+
+        The centerline is an external provisional route annotation.  It is
+        used for teacher shaping and diagnostics, never exposed to the visual
+        actor as an observation or treated as proof of free-space connectivity.
+        """
+        if self._cave_centerline is None:
+            self._cave_collision.zero_()
+            self._cave_contact_force_n.zero_()
+            self._cave_centerline_distance.zero_()
+            self._cave_route_chainage.zero_()
+            self._cave_local_clearance.fill_(float("inf"))
+            return
+
+        relative_pos = self._robot.data.root_pos_w - self.scene.env_origins
+        distances_sq = torch.sum(
+            (relative_pos.unsqueeze(1) - self._cave_centerline.unsqueeze(0)).square(), dim=-1
+        )
+        nearest_distance_sq, nearest_index = distances_sq.min(dim=1)
+        self._cave_centerline_distance = torch.sqrt(nearest_distance_sq.clamp_min(0.0))
+        assert self._cave_chainage is not None
+        self._cave_route_chainage = self._cave_chainage[nearest_index]
+        if self._cave_surface_clearance is not None:
+            self._cave_local_clearance = self._cave_surface_clearance[nearest_index]
+        else:
+            self._cave_local_clearance.fill_(float("inf"))
+        self._cave_contact_force_n.zero_()
+        if self._contact_sensor is not None:
+            net_forces = self._contact_sensor.data.net_forces_w
+            if net_forces is not None:
+                self._cave_contact_force_n = torch.linalg.vector_norm(net_forces, dim=-1).amax(dim=-1)
+        self._cave_collision = self._cave_contact_force_n > float(self.cfg.collision_force_threshold_n)
+        self._episode_had_collision |= self._cave_collision
+
+    def _refresh_exploration_metrics(self) -> None:
+        if self._exploration_tracker is None:
+            return
+        relative_position = self._robot.data.root_pos_w - self.scene.env_origins
+        self._exploration_tracker.update(relative_position)
+
+        clearances = []
+        for camera in (self._camera_left, self._camera_right):
+            if camera is None:
+                continue
+            depth = camera.data.output.get("depth")
+            if depth is None:
+                continue
+            clearances.append(
+                robust_forward_clearance(
+                    depth,
+                    max_depth_m=float(self.cfg.visual_max_depth_m),
+                    crop_fraction=float(self.cfg.exploration_depth_crop_fraction),
+                    quantile=float(self.cfg.exploration_depth_quantile),
+                )
+            )
+        if clearances:
+            self._exploration_forward_clearance_m = torch.stack(clearances, dim=0).amin(dim=0)
+        else:
+            self._exploration_forward_clearance_m.fill_(float(self.cfg.visual_max_depth_m))
+
+    def _refresh_cave_entry_metrics(self) -> None:
+        """Update the automatically inferred portal-crossing event."""
+        if not bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            self._cave_entry_event.zero_()
+            return
+        relative_position = self._robot.data.root_pos_w - self.scene.env_origins
+        portal_position = self._cave_portal_positions[self._cave_entry_portal_id]
+        inward = self._cave_portal_directions[self._cave_entry_portal_id]
+        delta = relative_position - portal_position
+        signed_depth = torch.sum(delta * inward, dim=-1)
+        radial = torch.linalg.vector_norm(delta - signed_depth.unsqueeze(-1) * inward, dim=-1)
+        inside_gate = (signed_depth >= float(self.cfg.cave_entry_depth_m)) & (
+            radial <= float(self.cfg.cave_entry_gate_radius_m)
+        )
+        self._cave_entry_signed_depth_m.copy_(signed_depth)
+        self._cave_entry_radial_distance_m.copy_(radial)
+        self._cave_entry_event.copy_(inside_gate & ~self._episode_entered_cave)
+        self._episode_entered_cave |= inside_gate
+
+    def _sample_cave_entry_spawn(
+        self, env_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample an exterior pose from inferred portal geometry."""
+        assert self._cave_centerline is not None and self._cave_chainage is not None
+        count = env_ids.numel()
+        portal_ids = torch.randint(len(self._cave_portals), (count,), device=self.device)
+        self._cave_entry_portal_id[env_ids] = portal_ids
+        minimum, maximum = (float(value) for value in self.cfg.cave_entry_spawn_distance_range_m)
+        if minimum <= 0.0 or maximum < minimum:
+            raise ValueError("cave_entry_spawn_distance_range_m must be positive and ordered")
+        available = torch.tensor(
+            [portal.exterior_run_m for portal in self._cave_portals],
+            dtype=torch.float32,
+            device=self.device,
+        )[portal_ids]
+        if bool(torch.any(available < minimum)):
+            raise ValueError("Inferred portal exterior run is shorter than the minimum spawn distance")
+        upper = torch.minimum(torch.full_like(available, maximum), available)
+        distance = minimum + torch.rand(count, device=self.device) * (upper - minimum)
+        query_chainage = self._cave_portal_chainages[portal_ids] - (
+            self._cave_portal_chainage_directions[portal_ids] * distance
+        )
+        spawn = interpolate_polyline(self._cave_centerline, self._cave_chainage, query_chainage)
+
+        inward = self._cave_portal_directions[portal_ids]
+        lateral = torch.stack((-inward[:, 1], inward[:, 0], torch.zeros_like(inward[:, 0])), dim=-1)
+        lateral = lateral / torch.linalg.vector_norm(lateral, dim=-1, keepdim=True).clamp_min(1.0e-6)
+        lateral_jitter = float(self.cfg.cave_entry_spawn_lateral_jitter_m)
+        vertical_jitter = float(self.cfg.cave_entry_spawn_vertical_jitter_m)
+        if lateral_jitter > 0.0:
+            spawn += lateral * torch.empty(count, 1, device=self.device).uniform_(
+                -lateral_jitter, lateral_jitter
+            )
+        if vertical_jitter > 0.0:
+            spawn[:, 2] += torch.empty(count, device=self.device).uniform_(
+                -vertical_jitter, vertical_jitter
+            )
+        yaw = torch.atan2(inward[:, 1], inward[:, 0])
+        if bool(getattr(self.cfg, "exploration_random_yaw", False)):
+            yaw.uniform_(-math.pi, math.pi)
+        return spawn, yaw, query_chainage
 
     def _reset_idx(self, env_ids: Sequence[int] | None) -> None:
         if env_ids is None:
@@ -416,11 +933,48 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
         if env_ids.numel() > 0:
+            if self._exploration_tracker is not None:
+                self._last_episode_workspace_coverage[env_ids] = (
+                    self._exploration_tracker.workspace_coverage_fraction[env_ids]
+                )
+                self._last_episode_unique_voxels[env_ids] = self._exploration_tracker.visited_count[env_ids]
+                self._last_episode_path_length_m[env_ids] = self._exploration_tracker.path_length_m[env_ids]
+            self._last_episode_success[env_ids] = self._success[env_ids]
+            self._last_episode_out_of_bounds[env_ids] = self._out_of_bounds[env_ids]
+            self._last_episode_timeout[env_ids] = self.reset_time_outs[env_ids]
+            self._last_episode_collision[env_ids] = self._episode_had_collision[env_ids]
             self.extras["log"] = {
                 f"Episode_Reward/{key}": self._episode_sums[key][env_ids].mean().item()
                 for key in self._episode_sums
             }
             self.extras["log"]["Metrics/success_rate"] = self._success[env_ids].float().mean().item()
+            self.extras["log"]["Metrics/collision_rate"] = self._episode_had_collision[env_ids].float().mean().item()
+            self.extras["log"]["Metrics/route_deviation_m"] = self._cave_centerline_distance[env_ids].mean().item()
+            self.extras["log"]["Metrics/contact_force_n"] = self._cave_contact_force_n[env_ids].mean().item()
+            self.extras["episode_success"] = self._last_episode_success.clone()
+            self.extras["episode_out_of_bounds"] = self._last_episode_out_of_bounds.clone()
+            self.extras["episode_timeout"] = self._last_episode_timeout.clone()
+            self.extras["episode_collision"] = self._last_episode_collision.clone()
+            self.extras["episode_workspace_coverage"] = self._last_episode_workspace_coverage.clone()
+            self.extras["episode_unique_voxels"] = self._last_episode_unique_voxels.clone()
+            self.extras["episode_path_length_m"] = self._last_episode_path_length_m.clone()
+            if self._exploration_tracker is not None:
+                self.extras["log"]["Metrics/workspace_coverage_fraction"] = (
+                    self._last_episode_workspace_coverage[env_ids].mean().item()
+                )
+                self.extras["log"]["Metrics/unique_voxels"] = (
+                    self._last_episode_unique_voxels[env_ids].float().mean().item()
+                )
+                self.extras["log"]["Metrics/path_length_m"] = (
+                    self._last_episode_path_length_m[env_ids].mean().item()
+                )
+            if bool(getattr(self.cfg, "cave_entry_enabled", False)):
+                self.extras["log"]["Metrics/cave_entry_rate"] = (
+                    self._episode_entered_cave[env_ids].float().mean().item()
+                )
+                self.extras["log"]["Metrics/entry_signed_depth_m"] = (
+                    self._cave_entry_signed_depth_m[env_ids].mean().item()
+                )
             for values in self._episode_sums.values():
                 values[env_ids] = 0.0
 
@@ -439,15 +993,45 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._desired_velocity_b[env_ids] = 0.0
         self._desired_yaw_rate[env_ids] = 0.0
+        if self._light_intensity_scale.shape[1] > 0:
+            self._light_intensity_scale[env_ids] = float(getattr(self.cfg, "light_control_default_scale", 1.0))
 
         count = env_ids.numel()
         root_state = self._robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
-        root_state[:, :2] += torch.empty(count, 2, device=self.device).uniform_(
-            -self.cfg.reset_xy_m, self.cfg.reset_xy_m
-        )
-        root_state[:, 2] = torch.empty(count, device=self.device).uniform_(*self.cfg.reset_depth_range_m)
-        yaw = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
+        spawn_route_chainage: torch.Tensor | None = None
+        if self._cave_centerline is None:
+            root_state[:, :2] += torch.empty(count, 2, device=self.device).uniform_(
+                -self.cfg.reset_xy_m, self.cfg.reset_xy_m
+            )
+            root_state[:, 2] = torch.empty(count, device=self.device).uniform_(*self.cfg.reset_depth_range_m)
+            yaw = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
+        elif bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            spawn, yaw, spawn_route_chainage = self._sample_cave_entry_spawn(env_ids)
+            root_state[:, :3] = spawn + self.scene.env_origins[env_ids]
+            # The entry task has no goal.  Keep the legacy storage benign so
+            # accidental future use cannot encode an inferred portal vector.
+            self._goal_pos_w[env_ids] = root_state[:, :3]
+        else:
+            assert self._cave_chainage is not None
+            spawn_chainage = float(getattr(self.cfg.world, "spawn_chainage_m", 2.0))
+            goal_chainage = float(getattr(self.cfg.world, "goal_chainage_m", spawn_chainage + 10.0))
+            spawn_idx = torch.argmin((self._cave_chainage - spawn_chainage).abs())
+            goal_idx = torch.argmin((self._cave_chainage - goal_chainage).abs())
+            spawn = self._cave_centerline[spawn_idx].expand(count, -1).clone()
+            spawn_route_chainage = torch.full(
+                (count,), float(self._cave_chainage[spawn_idx]), device=self.device
+            )
+            if float(getattr(self.cfg.world, "spawn_jitter_m", 0.0)) > 0.0:
+                spawn += torch.randn_like(spawn) * float(self.cfg.world.spawn_jitter_m)
+            root_state[:, :3] = spawn + self.scene.env_origins[env_ids]
+            goal = self._cave_centerline[goal_idx].expand(count, -1)
+            self._goal_pos_w[env_ids] = goal + self.scene.env_origins[env_ids]
+            next_idx = min(int(spawn_idx.item()) + 1, self._cave_centerline.shape[0] - 1)
+            tangent = self._cave_centerline[next_idx] - self._cave_centerline[spawn_idx]
+            yaw = torch.full((count,), torch.atan2(tangent[1], tangent[0]).item(), device=self.device)
+            if bool(getattr(self.cfg, "exploration_random_yaw", False)):
+                yaw.uniform_(-math.pi, math.pi)
         root_state[:, 3:7] = 0.0
         root_state[:, 3] = torch.cos(0.5 * yaw)
         root_state[:, 6] = torch.sin(0.5 * yaw)
@@ -455,21 +1039,54 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
 
-        angle = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
-        radius = torch.empty(count, device=self.device).uniform_(*self.cfg.goal_distance_range_m)
-        self._goal_pos_w[env_ids, 0] = self.scene.env_origins[env_ids, 0] + radius * torch.cos(angle)
-        self._goal_pos_w[env_ids, 1] = self.scene.env_origins[env_ids, 1] + radius * torch.sin(angle)
-        vertical_offset = torch.empty(count, device=self.device).uniform_(
-            -self.cfg.goal_vertical_offset_m, self.cfg.goal_vertical_offset_m
-        )
-        self._goal_pos_w[env_ids, 2] = (root_state[:, 2] + vertical_offset).clamp(
-            0.5, self.cfg.workspace_size_m[2] - 0.5
-        )
+        if self._cave_centerline is None:
+            angle = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
+            radius = torch.empty(count, device=self.device).uniform_(*self.cfg.goal_distance_range_m)
+            self._goal_pos_w[env_ids, 0] = self.scene.env_origins[env_ids, 0] + radius * torch.cos(angle)
+            self._goal_pos_w[env_ids, 1] = self.scene.env_origins[env_ids, 1] + radius * torch.sin(angle)
+            vertical_offset = torch.empty(count, device=self.device).uniform_(
+                -self.cfg.goal_vertical_offset_m, self.cfg.goal_vertical_offset_m
+            )
+            self._goal_pos_w[env_ids, 2] = (root_state[:, 2] + vertical_offset).clamp(
+                0.5, float(self.cfg.workspace_size_m[2]) - 0.5
+            )
         self._previous_distance[env_ids] = torch.linalg.vector_norm(
             self._goal_pos_w[env_ids] - root_state[:, :3], dim=-1
         )
         self._success[env_ids] = False
         self._out_of_bounds[env_ids] = False
+        self._cave_collision[env_ids] = False
+        self._episode_had_collision[env_ids] = False
+        self._last_episode_collision[env_ids] = False
+        self._cave_contact_force_n[env_ids] = 0.0
+        self._cave_centerline_distance[env_ids] = 0.0
+        self._cave_route_chainage[env_ids] = 0.0
+        self._previous_cave_route_chainage[env_ids] = 0.0
+        self._cave_local_clearance[env_ids] = float("inf")
+        self._exploration_forward_clearance_m[env_ids] = float(self.cfg.visual_max_depth_m)
+        self._cave_entry_event[env_ids] = False
+        self._episode_entered_cave[env_ids] = False
+        if spawn_route_chainage is not None:
+            self._previous_cave_route_chainage[env_ids] = spawn_route_chainage
+            self._cave_route_chainage[env_ids] = spawn_route_chainage
+        if bool(getattr(self.cfg, "cave_entry_enabled", False)):
+            portal_position = self._cave_portal_positions[self._cave_entry_portal_id[env_ids]]
+            inward = self._cave_portal_directions[self._cave_entry_portal_id[env_ids]]
+            delta = root_state[:, :3] - self.scene.env_origins[env_ids] - portal_position
+            signed_depth = torch.sum(delta * inward, dim=-1)
+            self._cave_entry_signed_depth_m[env_ids] = signed_depth
+            self._cave_entry_radial_distance_m[env_ids] = torch.linalg.vector_norm(
+                delta - signed_depth.unsqueeze(-1) * inward, dim=-1
+            )
+        else:
+            self._cave_entry_signed_depth_m[env_ids] = 0.0
+            self._cave_entry_radial_distance_m[env_ids] = 0.0
+        if self._exploration_tracker is not None:
+            self._exploration_tracker.reset(
+                env_ids,
+                root_state[:, :3] - self.scene.env_origins[env_ids],
+            )
+        self._update_light_prims()
 
     def _ground_truth_state(self) -> GroundTruthState:
         timestamp_s = float(self.common_step_counter * self.step_dt)
@@ -486,35 +1103,63 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         ground_truth = self._ground_truth_state()
         timestamp_s = ground_truth.timestamp_s
         rgb = depth = imu_acceleration = imu_angular_velocity = None
+        rgb_left = rgb_right = depth_left = depth_right = None
         if self._camera is not None:
             rgb = self._camera.data.output.get("rgb")
             depth = self._camera.data.output.get("depth")
-            if rgb is not None and depth is not None:
-                appearance_kwargs = {}
-                if self._domain_gap_samples is not None:
-                    appearance_kwargs = {
-                        "visibility_range_m": self._domain_gap_samples["visibility_range_m"],
-                        "attenuation_scale": self._domain_gap_samples["attenuation_scale"],
-                        "backscatter_strength": self._domain_gap_samples["backscatter_strength"],
-                        "exposure_offset": self._domain_gap_samples["exposure_offset"],
-                        "motion_blur_strength": self._domain_gap_samples["motion_blur_strength"],
-                    }
-                rgb = apply_underwater_appearance(rgb, depth, self.cfg.appearance, **appearance_kwargs)
-            if self._domain_gap_samples is not None and rgb is not None:
-                rgb_noise = torch.randn(rgb.shape, device=self.device)
-                rgb_std = self._domain_gap_samples["camera_noise_std"].reshape(
-                    self.num_envs, *([1] * (rgb.ndim - 1))
-                )
-                if rgb.dtype == torch.uint8:
-                    rgb = (rgb.float() + rgb_noise * rgb_std * 255.0).clamp(0.0, 255.0).to(torch.uint8)
+        if self._camera_left is not None:
+            rgb_left = self._camera_left.data.output.get("rgb")
+            depth_left = self._camera_left.data.output.get("depth")
+            # Preserve the established mono packet contract: ``rgb/depth``
+            # refer to the left camera whenever stereo mode is active.
+            rgb = rgb_left
+            depth = depth_left
+        if self._camera_right is not None:
+            rgb_right = self._camera_right.data.output.get("rgb")
+            depth_right = self._camera_right.data.output.get("depth")
+        appearance_kwargs = {}
+        if self._domain_gap_samples is not None:
+            appearance_kwargs = {
+                "visibility_range_m": self._domain_gap_samples["visibility_range_m"],
+                "attenuation_scale": self._domain_gap_samples["attenuation_scale"],
+                "backscatter_strength": self._domain_gap_samples["backscatter_strength"],
+                "exposure_offset": self._domain_gap_samples["exposure_offset"],
+                "motion_blur_strength": self._domain_gap_samples["motion_blur_strength"],
+            }
+        if rgb is not None and depth is not None:
+            rgb = apply_underwater_appearance(rgb, depth, self.cfg.appearance, **appearance_kwargs)
+        if rgb_right is not None and depth_right is not None:
+            rgb_right = apply_underwater_appearance(rgb_right, depth_right, self.cfg.appearance, **appearance_kwargs)
+        if self._domain_gap_samples is not None:
+            rgb_std = self._domain_gap_samples["camera_noise_std"]
+            depth_std = self._domain_gap_samples["depth_noise_std"]
+            for image_name in ("rgb", "rgb_right"):
+                image = locals()[image_name]
+                if image is None:
+                    continue
+                noise = torch.randn(image.shape, device=self.device)
+                per_env_std = rgb_std.reshape(self.num_envs, *([1] * (image.ndim - 1)))
+                if image.dtype == torch.uint8:
+                    image = (image.float() + noise * per_env_std * 255.0).clamp(0.0, 255.0).to(torch.uint8)
                 else:
-                    rgb = (rgb.float() + rgb_noise * rgb_std).clamp(0.0, 1.0).to(rgb.dtype)
-            if self._domain_gap_samples is not None and depth is not None:
-                depth_noise = torch.randn(depth.shape, device=self.device)
-                depth_std = self._domain_gap_samples["depth_noise_std"].reshape(
-                    self.num_envs, *([1] * (depth.ndim - 1))
-                )
-                depth = (depth.float() + depth_noise * depth_std).clamp_min(0.0).to(depth.dtype)
+                    image = (image.float() + noise * per_env_std).clamp(0.0, 1.0).to(image.dtype)
+                if image_name == "rgb":
+                    rgb = image
+                else:
+                    rgb_right = image
+            for depth_name in ("depth", "depth_right"):
+                image = locals()[depth_name]
+                if image is None:
+                    continue
+                noise = torch.randn(image.shape, device=self.device)
+                per_env_std = depth_std.reshape(self.num_envs, *([1] * (image.ndim - 1)))
+                image = (image.float() + noise * per_env_std).clamp_min(0.0).to(image.dtype)
+                if depth_name == "depth":
+                    depth = image
+                else:
+                    depth_right = image
+        if self._camera_left is not None:
+            rgb_left, depth_left = rgb, depth
         if self._imu is not None:
             imu_acceleration = self._imu.data.lin_acc_b
             imu_angular_velocity = self._imu.data.ang_vel_b
@@ -575,6 +1220,10 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                     timestamp_s=packet_timestamp,
                     rgb=None if rgb is None or dropped else rgb[robot_index],
                     depth=None if depth is None or dropped else depth[robot_index],
+                    rgb_left=None if rgb_left is None or dropped else rgb_left[robot_index],
+                    rgb_right=None if rgb_right is None or dropped else rgb_right[robot_index],
+                    depth_left=None if depth_left is None or dropped else depth_left[robot_index],
+                    depth_right=None if depth_right is None or dropped else depth_right[robot_index],
                     imu_acceleration=None if imu_acceleration is None else imu_acceleration[robot_index],
                     imu_angular_velocity=None if imu_angular_velocity is None else imu_angular_velocity[robot_index],
                     pressure_depth_m=pressure_depth[robot_index],
@@ -594,9 +1243,20 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                     sensor_metadata={
                         "rgb": rgb is not None and not dropped,
                         "depth": depth is not None and not dropped,
+                        "stereo": rgb_left is not None and rgb_right is not None,
+                        "rgb_left": rgb_left is not None and not dropped,
+                        "rgb_right": rgb_right is not None and not dropped,
+                        "depth_left": depth_left is not None and not dropped,
+                        "depth_right": depth_right is not None and not dropped,
+                        "stereo_baseline_m": getattr(self.cfg, "stereo_baseline_m", None),
+                        "stereo_baseline_source": "bluerov2.scn position-derived candidate; baseline attribute unresolved",
+                        "stereo_near_clip_m": getattr(self.cfg, "stereo_near_clip_m", None),
+                        "stereo_near_clip_reason": "estimated self-occlusion guard for opaque visual hull",
                         "imu": imu_acceleration is not None,
                         "pressure": True,
                         "ground_truth": True,
+                        "contact_force_n": float(self._cave_contact_force_n[robot_index].item()),
+                        "contact_proxy": "unfiltered_static_collider" if self._contact_sensor is not None else "disabled",
                         "timestamp_tolerance_s": 1.0e-4,
                         "timestamp_jitter_s": float(jitter[robot_index].item()),
                         "frame_dropped": dropped,
@@ -608,7 +1268,7 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                         "motion_blur_strength": motion_blur_strength,
                         "domain_randomization": self._domain_gap_metadata(robot_index),
                     },
-                    collision=bool(self._out_of_bounds[robot_index].item()),
+                    collision=bool((self._out_of_bounds[robot_index] | self._cave_collision[robot_index]).item()),
                     goal_position_w=self._goal_pos_w[robot_index],
                     reward=None if rewards is None else rewards[robot_index],
                 )
@@ -742,6 +1402,73 @@ class UnderwaterPointNavPerceptionEnvCfg(UnderwaterPointNavEnvCfg):
     )
 
 
+_STEREO_SENSOR_CFG = SensorSuiteCfg(
+    rgb_enabled=True,
+    depth_enabled=True,
+    imu_enabled=True,
+    camera_width=160,
+    camera_height=120,
+    camera_rate_hz=15.0,
+    # The source-derived x=0.16 m camera points lie inside the opaque visual
+    # hull (front bound is approximately x=0.222 m).  A near plane beyond the
+    # hull suppresses self-occlusion until a transparent housing/CAD camera
+    # mount is available.  This is an engineering guard, not calibration.
+    camera_near_clip_m=0.25,
+)
+
+# Contact reporters are deliberately scoped to the visual cave pilot.  The
+# open-water and legacy PointNav presets keep reporters disabled for throughput.
+# GPU PhysX 5.1 cannot filter contacts against the imported triangle cave
+# collider.  Keep the sensor unfiltered: the resulting force is a conservative
+# static-collider contact signal (cave/seabed), not a cave-only ground truth.
+_CAVE_CONTACT_SENSOR_CFG = ContactSensorCfg(
+    prim_path="/World/envs/env_.*/Robot",
+    update_period=0.0,
+    track_air_time=False,
+    debug_vis=False,
+)
+
+
+@configclass
+class UnderwaterPointNavStereoEnvCfg(UnderwaterPointNavEnvCfg):
+    """Stereo RGB/depth task with independent active-light commands.
+
+    The policy still commands body velocity plus yaw rate.  The two extra
+    action dimensions control left/right lamp intensity in ``[0, 1]`` after
+    the normalized action mapping.  A future visual policy can therefore
+    learn illumination scheduling without changing the vehicle controller.
+    """
+
+    action_space = 6
+    light_control_enabled = True
+    light_control_channels = 2
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=4,
+        env_spacing=24.0,
+        replicate_physics=True,
+        clone_in_fabric=False,
+    )
+    camera_sensor: TiledCameraCfg | None = None
+    camera_left_sensor: TiledCameraCfg | None = _STEREO_SENSOR_CFG.stereo_camera_cfgs(
+        "/World/envs/env_.*/Robot/CameraLeft",
+        "/World/envs/env_.*/Robot/CameraRight",
+    )[0]
+    camera_right_sensor: TiledCameraCfg | None = _STEREO_SENSOR_CFG.stereo_camera_cfgs(
+        "/World/envs/env_.*/Robot/CameraLeft",
+        "/World/envs/env_.*/Robot/CameraRight",
+    )[1]
+    imu_sensor: ImuCfg | None = _STEREO_SENSOR_CFG.imu_cfg("/World/envs/env_.*/Robot")
+    stereo_baseline_m = _STEREO_SENSOR_CFG.stereo_baseline_m
+    stereo_near_clip_m = _STEREO_SENSOR_CFG.camera_near_clip_m
+    lighting: UnderwaterLightingCfg = bluerov2_candidate_lighting(four_lights=False)
+    appearance: UnderwaterAppearanceCfg = UnderwaterAppearanceCfg(
+        enabled=True,
+        visibility_range_m=12.0,
+        attenuation_rgb_per_m=(0.18, 0.07, 0.035),
+        backscatter_strength=0.15,
+    )
+
+
 @configclass
 class UnderwaterPointNavImuEnvCfg(UnderwaterPointNavEnvCfg):
     """Camera-free IMU and vehicle-light runtime check."""
@@ -775,3 +1502,163 @@ class UnderwaterPointNavImuEnvCfg(UnderwaterPointNavEnvCfg):
             ),
         ),
     )
+
+
+def _default_cave_world(config_name: str, *, visual_enabled: bool) -> CaveWorldCfg:
+    """Resolve the default cave registry without requiring conversion at import time."""
+    world = load_cave_world_cfg(config_name, require_converted=False)
+    world.visual_enabled = visual_enabled
+    return world
+
+
+@configclass
+class UnderwaterCavePointNavEnvCfg(UnderwaterPointNavEnvCfg):
+    """State/teacher cave task using collision-only cave copies for PPO throughput."""
+
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=32,
+        env_spacing=24.0,
+        replicate_physics=False,
+        # Fabric cloning currently fails on the imported triangle collision
+        # mesh. Standard USD cloning is slower but keeps one cave per env.
+        clone_in_fabric=False,
+    )
+    sim: SimulationCfg = SimulationCfg(
+        dt=1.0 / 60.0,
+        render_interval=3,
+        device="cuda:0",
+        use_fabric=False,
+        physx=PhysxCfg(
+            gpu_max_rigid_contact_count=2**18,
+            gpu_max_rigid_patch_count=2**14,
+            gpu_found_lost_pairs_capacity=2**16,
+            gpu_found_lost_aggregate_pairs_capacity=2**16,
+            gpu_total_aggregate_pairs_capacity=2**16,
+            gpu_heap_capacity=2**24,
+            gpu_temp_buffer_capacity=2**23,
+        ),
+    )
+    world: CaveWorldCfg = _default_cave_world("worlds/synthetic_cave_turn90.yaml", visual_enabled=False)
+    detailed_robot_visual = False
+
+
+@configclass
+class UnderwaterCavePerceptionEnvCfg(UnderwaterPointNavPerceptionEnvCfg):
+    """Cave scene with visual mesh and RGB/depth/IMU sensors for perception smoke."""
+
+    world: CaveWorldCfg = _default_cave_world("worlds/porth_yr_ogof_sump9.yaml", visual_enabled=True)
+
+
+@configclass
+class UnderwaterCaveStereoEnvCfg(UnderwaterPointNavStereoEnvCfg):
+    """Porth cave scene with stereo RGB/depth and active-light control."""
+
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=2,
+        env_spacing=24.0,
+        replicate_physics=False,
+        clone_in_fabric=False,
+    )
+    world: CaveWorldCfg = _default_cave_world("worlds/porth_yr_ogof_sump9.yaml", visual_enabled=True)
+    detailed_robot_visual = True
+
+
+@configclass
+class UnderwaterCaveVisualPilotEnvCfg(UnderwaterCaveStereoEnvCfg):
+    """Goal-conditioned visual actor with a privileged 19-D critic state.
+
+    This is the first visual-PPO pilot.  The mission command is the local goal
+    direction/distance already used by PointNav; it is not an entrance label or
+    a cave geometry observation.  A later exploration task will replace this
+    command with an explicit frontier/route objective.
+    """
+
+    observation_space = visual_feature_dim(
+        output_hw=(12, 16),
+        include_imu=True,
+        include_pressure=True,
+        include_previous_action=True,
+        action_dim=6,
+        mission_command_dim=4,
+    )
+    # navigation_observation_to_tensor emits 19 values; the legacy base cfg
+    # predates the explicit three-axis angular velocity fields.
+    state_space = 19
+    visual_observation_enabled = True
+    cave_route_reward_enabled = True
+    robot: RigidObjectCfg = make_underwater_robot_cfg(
+        load_config("robot.yaml"), activate_contact_sensors=True
+    )
+    contact_sensor: ContactSensorCfg | None = _CAVE_CONTACT_SENSOR_CFG
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=2,
+        env_spacing=24.0,
+        replicate_physics=False,
+        clone_in_fabric=False,
+    )
+
+
+@configclass
+class UnderwaterCaveExploreEnvCfg(UnderwaterCaveVisualPilotEnvCfg):
+    """Label-free cave coverage curriculum for the stereo CNN/GRU actor.
+
+    The actor receives no goal vector, centerline coordinate, visitation map,
+    or entrance label.  A fixed collision-checked, centerline-derived spawn is
+    still used; the separate entry task owns portal inference and entry metrics.
+    """
+
+    episode_length_s = 30.0
+    observation_space = visual_feature_dim(
+        output_hw=(12, 16),
+        include_imu=True,
+        include_pressure=True,
+        include_previous_action=True,
+        action_dim=6,
+        mission_command_dim=0,
+    )
+    state_space = 21
+    visual_mission_command_enabled = False
+    exploration_reward_enabled = True
+    exploration_voxel_size_m = 0.5
+    exploration_new_voxel_reward = 1.0
+    exploration_revisit_penalty = 0.002
+    exploration_clearance_margin_m = 0.8
+    exploration_clearance_penalty_weight = 2.0
+    exploration_random_yaw = True
+
+    # Disable every goal/route shaping term.  Contact, action cost, workspace
+    # bounds, visual clearance, and new-voxel reward remain active.
+    progress_weight = 0.0
+    goal_bonus = 0.0
+    heading_weight = 0.0
+    cave_route_reward_enabled = False
+
+
+@configclass
+class UnderwaterCaveEntryEnvCfg(UnderwaterCaveExploreEnvCfg):
+    """Find and cross a geometry-inferred cave portal using vision only.
+
+    Reset and success geometry comes from an automatic skeleton-clearance
+    transition.  The actor observation remains exactly the same 1549-D
+    no-command stereo contract as the coverage curriculum.
+    """
+
+    episode_length_s = 20.0
+    state_space = 24
+    cave_entry_enabled = True
+    cave_entry_minimum_clearance_m = 0.65
+    cave_entry_minimum_exterior_run_m = 1.0
+    cave_entry_tangent_probe_m = 1.5
+    cave_entry_spawn_distance_range_m = (1.5, 2.5)
+    cave_entry_spawn_lateral_jitter_m = 0.10
+    cave_entry_spawn_vertical_jitter_m = 0.05
+    cave_entry_gate_radius_m = 1.5
+    cave_entry_depth_m = 0.75
+    cave_entry_bonus = 25.0
+    cave_entry_terminate_on_success = True
+    cave_contact_termination_enabled = True
+
+    # Intrinsic novelty is only a weak search prior here; crossing the inferred
+    # portal is the dominant sparse event.  No dense direction reward is used.
+    exploration_new_voxel_reward = 0.05
+    exploration_revisit_penalty = 0.001

@@ -1,0 +1,11 @@
+name: open_water_benchmark
+size_m: [20.0, 20.0, 8.0]
+seabed_depth_m: 8.0
+asset_path: null
+asset_scale: 1.0
+obstacles_enabled: false
+landmarks_enabled: false
+landmark_positions_m: []
+obstacle_positions_m: []
+obstacle_size_m: [1.0, 1.0, 1.0]
+plugin: isaac_underwater.worlds.base:OpenWaterWorldCfg

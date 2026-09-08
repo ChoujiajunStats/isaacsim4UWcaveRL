@@ -1,0 +1,24 @@
+# Source-traceable active-light candidate for visual experiments.
+# Manufacturer evidence: two or four lamps, 1500 lm each, 135 deg beam.
+# Exact lamp poses and Isaac RTX photometric scale are NOT YET VALIDATED.
+variant: two_light
+source_type: published_flux_estimated_pose
+source: Blue Robotics BlueROV2 datasheet 2025
+confidence: medium_flux_low_pose
+lights:
+  - name: FrontLightLeft
+    position_b_m: [0.32, 0.12, 0.03]
+    direction_b: [1.0, 0.0, 0.0]
+    luminous_flux_lm: 1500.0
+    beam_angle_deg: 135.0
+    pose_status: estimated
+  - name: FrontLightRight
+    position_b_m: [0.32, -0.12, 0.03]
+    direction_b: [1.0, 0.0, 0.0]
+    luminous_flux_lm: 1500.0
+    beam_angle_deg: 135.0
+    pose_status: estimated
+baseline_note: >-
+  The supplied Stonefish scene does not provide a reliable lamp CAD pose. The
+  positions above are a provisional symmetric candidate and must be measured
+  on the user's vehicle before real-world calibration.

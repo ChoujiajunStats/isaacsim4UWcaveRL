@@ -1,0 +1,7 @@
+gpu: RTX 4060 Laptop GPU
+vram_total_mb: 8188
+recommended_max_vram_mb: 7000
+physics_env_sweep: [32, 64, 128, 256, 512]
+perception_env_sweep: [1, 4, 8, 16]
+physics_only: true
+camera_rendering: opt_in

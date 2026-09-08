@@ -1,0 +1,9 @@
+mass_kg: 20.0
+inertia_source: uniform_box_approximation
+inertia_kg_m2: [0.5666667, 1.2166667, 1.4833333]
+geometry_size_m: [0.8, 0.5, 0.3]
+center_of_mass_m: [0.0, 0.0, 0.0]
+center_of_buoyancy_m: [0.0, 0.0, 0.04]
+thruster_layout: bluerov2_like_8
+max_linear_velocity_mps: 4.0
+max_angular_velocity_radps: 3.1415926536

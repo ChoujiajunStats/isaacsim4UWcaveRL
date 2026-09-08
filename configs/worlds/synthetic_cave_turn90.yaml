@@ -1,0 +1,18 @@
+name: synthetic_cave_turn90
+asset_root_env: ISAAC_UNDERWATER_ASSET_ROOT
+asset_root_default: /home/kenton/Downloads/assets
+visual_source: converted/synthetic_cave_turn90_visual.obj
+collision_source: collision/synthetic_cave_turn90_collision.obj
+metadata: metadata/synthetic_cave_turn90.yaml
+centerline: metadata/online_bend90_route.csv
+asset_scale: 1.0
+asset_translation_m: [0.0, 0.0, 0.0]
+asset_orientation_wxyz: [1.0, 0.0, 0.0, 0.0]
+spawn_chainage_m: 1.0
+goal_chainage_m: 5.0
+spawn_jitter_m: 0.0
+navigation_workspace_size_m: [24.0, 24.0, 10.0]
+scale_status: validated_procedural_meters
+candidate_status: synthetic_acceptance_only
+clone_per_env: true
+visual_enabled: true

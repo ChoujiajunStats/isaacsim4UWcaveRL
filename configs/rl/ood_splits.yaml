@@ -1,0 +1,12 @@
+# Reproducible experiment split contract for future OOD / zero-shot studies.
+train:
+  worlds: [open_water_nominal_a, open_water_nominal_b]
+  lighting: [nominal, low_light]
+  visibility_range_m: [10.0, 20.0]
+  current_speed_mps: [0.0, 0.2]
+test_zero_shot:
+  worlds: [unseen_open_water_c, reconstructed_cave_plugin]
+  lighting: [blue_shift, high_backscatter]
+  visibility_range_m: [4.0, 8.0]
+  current_speed_mps: [0.25, 0.5]
+localization_comparisons: [ground_truth, external_vio, external_vio_health_aware]

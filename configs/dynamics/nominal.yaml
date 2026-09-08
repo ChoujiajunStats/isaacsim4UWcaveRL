@@ -1,0 +1,17 @@
+water_density_kg_m3: 1025.0
+displaced_volume_m3: 0.0197073171
+gravity_mps2: 9.81
+center_of_buoyancy_m: [0.0, 0.0, 0.04]
+linear_drag_coeff: [12.0, 20.0, 25.0]
+quadratic_drag_coeff: [18.0, 28.0, 35.0]
+angular_linear_drag_coeff: [1.5, 1.5, 2.0]
+angular_quadratic_drag_coeff: [2.0, 2.0, 3.0]
+added_mass_kg: [0.0, 0.0, 0.0]
+added_inertia_kg_m2: [0.0, 0.0, 0.0]
+current_velocity_w_mps: [0.0, 0.0, 0.0]
+current:
+  mode: constant
+  amplitude_w_mps: [0.0, 0.0, 0.0]
+  period_s: 60.0
+  random_walk_std_mps: 0.01
+  max_speed_mps: 0.5

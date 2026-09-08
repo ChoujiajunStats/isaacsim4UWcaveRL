@@ -1,0 +1,14 @@
+enabled: true
+ambient_intensity: 180.0
+ambient_color_rgb: [0.08, 0.18, 0.22]
+distance_attenuation: 0.12
+flicker_amplitude: 0.0
+vehicle_lights:
+  - name: FrontLightLeft
+    position_b_m: [0.32, 0.12, 0.03]
+    direction_b: [1.0, 0.0, 0.0]
+    intensity: 900.0
+  - name: FrontLightRight
+    position_b_m: [0.32, -0.12, 0.03]
+    direction_b: [1.0, 0.0, 0.0]
+    intensity: 900.0

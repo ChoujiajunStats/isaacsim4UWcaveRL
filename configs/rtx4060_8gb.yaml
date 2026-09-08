@@ -1,0 +1,12 @@
+preset: rtx4060_8gb
+headless: true
+enable_cameras: false
+rendering: disabled
+num_envs: 128
+physics_dt: 0.0166666667
+decimation: 3
+vram_warning_mb: 7200
+vram_stop_mb: 7400
+small_actor_critic: true
+minimal_contact_buffers: true
+minimal_scene_complexity: true

@@ -1,0 +1,15 @@
+[package]
+version = "0.1.0"
+category = "isaaclab"
+title = "Isaac Underwater"
+author = "Isaac Underwater contributors"
+description = "Low-VRAM vectorized underwater reinforcement learning tasks"
+keywords = ["isaaclab", "underwater", "ppo"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_rl" = {}
+"isaaclab_tasks" = {}
+
+[[python.module]]
+name = "isaac_underwater"

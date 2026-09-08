@@ -1,0 +1,9 @@
+rgb_enabled: false
+depth_enabled: false
+imu_enabled: false
+pressure_enabled: false
+ground_truth_enabled: true
+camera_width: 160
+camera_height: 120
+camera_rate_hz: 15.0
+imu_rate_hz: 100.0
