@@ -91,6 +91,21 @@ references and safe entrance/exit semantics in parallel, runs PPO, reloads the
 checkpoint, and performs a two-second balanced evaluation. One iteration is
 only an integration test and cannot produce a useful navigator.
 
+The focused contact-reset regression deliberately drives the hard-scene robot
+into a wall, then requires the automatically reset episode to remain alive
+with zero contact force:
+
+```bash
+./.venv/bin/python scripts/smoke_cave_navigation.py \
+  --num_envs 3 --profile train_all --collision_reset_steps 240 \
+  --headless --device cuda:0
+```
+
+The cave ContactSensor retains one history sample so Isaac Lab refreshes it on
+every physics substep. Together with clearing the lazy sensor's reset flag,
+this prevents a pre-reset GPU triangle contact from causing repeated one-step
+episodes on the pinned Isaac Lab 2.3 stack.
+
 A first full experiment can use:
 
 ```bash
@@ -166,6 +181,7 @@ The following contracts pass on the RTX 4060 workstation:
 - visual/collision USD conversion for easy, medium, and hard;
 - heterogeneous three-scene spawning with the expected USD in every env;
 - safe entrance spawn and forced exit success/SPL semantics;
+- hard-wall contact followed by a clean, non-terminal automatic reset;
 - nominal and forced-frame-drop domain-randomized visual observations;
 - one-update recurrent PPO training, checkpoint loading, and balanced metrics.
 

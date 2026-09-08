@@ -15,6 +15,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=3)
 parser.add_argument("--profile", default="train_all")
 parser.add_argument("--domain_randomization", action="store_true")
+parser.add_argument(
+    "--collision_reset_steps",
+    type=int,
+    default=0,
+    help="Drive the hard-scene robot sideways and verify its post-contact reset.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -37,6 +43,10 @@ from isaaclab_tasks.utils import parse_env_cfg
 def main() -> None:
     task = "Isaac-Underwater-Cave-Navigation-v0"
     cfg = parse_env_cfg(task, device=args.device, num_envs=args.num_envs)
+    if args.collision_reset_steps > 0:
+        # Let the robot reach the physical wall before the route-deviation
+        # safety bound terminates the diagnostic episode.
+        cfg.route_deviation_hard_m = 100.0
     env = gym.make(task, cfg=cfg)
     try:
         obs, _ = env.reset()
@@ -88,6 +98,88 @@ def main() -> None:
         assert not torch.any(unwrapped._cave_collision), (
             f"entrance spawn starts in collision: {unwrapped._cave_contact_force_n}"
         )
+        assert torch.all(
+            unwrapped._cave_contact_force_n <= float(cfg.collision_force_threshold_n)
+        ), f"entrance spawn has raw contact force: {unwrapped._cave_contact_force_n}"
+
+        if args.collision_reset_steps > 0:
+            hard_scene_ids = [
+                index for index, scene in enumerate(variants) if scene.difficulty == "hard"
+            ]
+            if len(hard_scene_ids) != 1:
+                raise ValueError("--collision_reset_steps requires exactly one hard scene")
+            hard_env_ids = (unwrapped._cave_scene_ids == hard_scene_ids[0]).nonzero(
+                as_tuple=False
+            ).flatten()
+            if hard_env_ids.numel() == 0:
+                raise AssertionError("No environment was assigned to the hard scene")
+            hard_env_id = int(hard_env_ids[0].item())
+            # Isolate reset/contact behavior from the ordinary spawn jitter.
+            unwrapped._cave_scene_spawn_jitters[hard_scene_ids[0]] = 0.0
+            route_mask = unwrapped._multi_cave_route_mask[hard_scene_ids[0]]
+            route = unwrapped._multi_cave_centerlines[hard_scene_ids[0], route_mask]
+            chainage = unwrapped._multi_cave_chainages[hard_scene_ids[0], route_mask]
+            interior_chainage = unwrapped._cave_scene_spawn_chainages[hard_scene_ids[0]] + 10.0
+            interior_index = int(torch.argmin((chainage - interior_chainage).abs()).item())
+            tangent_index = min(interior_index + 1, route.shape[0] - 1)
+            tangent = route[tangent_index] - route[interior_index]
+            yaw = torch.atan2(tangent[1], tangent[0])
+            pose = unwrapped._robot.data.root_state_w[hard_env_id : hard_env_id + 1, :7].clone()
+            pose[:, :3] = route[interior_index] + unwrapped.scene.env_origins[hard_env_id]
+            pose[:, 3:7] = 0.0
+            pose[:, 3] = torch.cos(0.5 * yaw)
+            pose[:, 6] = torch.sin(0.5 * yaw)
+            unwrapped._robot.write_root_pose_to_sim(pose, hard_env_ids[:1])
+            unwrapped._robot.write_root_velocity_to_sim(
+                torch.zeros(1, 6, device=unwrapped.device), hard_env_ids[:1]
+            )
+            collision_seen = False
+            for _ in range(args.collision_reset_steps):
+                drive = torch.zeros(args.num_envs, 6, device=unwrapped.device)
+                drive[hard_env_id, 1] = 1.0
+                _, _, terminated, truncated, extras = env.step(drive)
+                done = terminated | truncated
+                if bool(done[hard_env_id] and extras["episode_collision"][hard_env_id]):
+                    collision_seen = True
+                    post_reset_steps = 3
+                    post_reset_trace = []
+                    for post_reset_step in range(1, post_reset_steps + 1):
+                        _, _, next_terminated, next_truncated, next_extras = env.step(
+                            torch.zeros(args.num_envs, 6, device=unwrapped.device)
+                        )
+                        reset_position = (
+                            unwrapped._robot.data.root_pos_w[hard_env_id]
+                            - unwrapped.scene.env_origins[hard_env_id]
+                        )
+                        post_reset_trace.append(
+                            (
+                                post_reset_step,
+                                [round(float(value), 3) for value in reset_position],
+                                round(float(unwrapped._cave_contact_force_n[hard_env_id]), 3),
+                            )
+                        )
+                        assert not bool(
+                            next_terminated[hard_env_id] | next_truncated[hard_env_id]
+                        ), (
+                            "hard scene terminated again after contact reset "
+                            f"at step {post_reset_step}: "
+                            f"collision={bool(next_extras['episode_collision'][hard_env_id])} "
+                            f"bounds={bool(next_extras['episode_out_of_bounds'][hard_env_id])} "
+                            f"success={bool(next_extras['episode_success'][hard_env_id])} "
+                            f"timeout={bool(next_extras['episode_timeout'][hard_env_id])} "
+                            f"terminal_force={next_extras.get('log', {}).get('Metrics/contact_force_n')} "
+                            f"trace={post_reset_trace}"
+                        )
+                        assert float(
+                            unwrapped._cave_contact_force_n[hard_env_id]
+                        ) <= float(cfg.collision_force_threshold_n), (
+                            "Raw contact force stayed stale after reset: "
+                            f"trace={post_reset_trace}"
+                        )
+                    break
+            assert collision_seen, (
+                f"No hard-scene contact occurred within {args.collision_reset_steps} steps"
+            )
 
         # Force one exact exit event per scene.  This checks task success,
         # immediate-reset outcome preservation, path metrics, and SPL without

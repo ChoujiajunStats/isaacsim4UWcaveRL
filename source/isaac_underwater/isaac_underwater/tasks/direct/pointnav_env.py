@@ -1056,7 +1056,9 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             net_forces = self._contact_sensor.data.net_forces_w
             if net_forces is not None:
                 self._cave_contact_force_n = torch.linalg.vector_norm(net_forces, dim=-1).amax(dim=-1)
-        self._cave_collision = self._cave_contact_force_n > float(self.cfg.collision_force_threshold_n)
+        self._cave_collision = self._cave_contact_force_n > float(
+            self.cfg.collision_force_threshold_n
+        )
         self._episode_had_collision |= self._cave_collision
 
     def _refresh_episode_path_length(self) -> None:
@@ -1329,6 +1331,13 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         root_state[:, 7:] = 0.0
         self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
+        if self._contact_sensor is not None:
+            # Reset the sensor after the pose teleport, matching the corrected
+            # upstream reset ordering.  Isaac Lab <= 2.3 also marks lazy
+            # sensors outdated during reset; clearing that flag is the
+            # task-local form of upstream IsaacLab PR #5782.
+            self._contact_sensor.reset(env_ids)
+            self._contact_sensor._is_outdated[env_ids] = False
 
         if not self._has_cave_route:
             angle = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
@@ -1745,6 +1754,10 @@ _STEREO_SENSOR_CFG = SensorSuiteCfg(
 _CAVE_CONTACT_SENSOR_CFG = ContactSensorCfg(
     prim_path="/World/envs/env_.*/Robot",
     update_period=0.0,
+    # A one-sample history makes ContactSensor consume every physics substep.
+    # In lazy mode, PhysX 5.1 can otherwise retain an ended triangle-mesh pair
+    # across a pose reset and repeatedly terminate the new episode.
+    history_length=1,
     track_air_time=False,
     debug_vis=False,
 )
