@@ -12,6 +12,7 @@ logs/*
 !logs/.gitkeep
 checkpoints/
 outputs/
+transfer/
 wandb/
 runs/
 
@@ -19,4 +20,3 @@ cache/
 data/ov/
 *.usd~
 *.log
-

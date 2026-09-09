@@ -5,6 +5,9 @@ finished, but **no checkpoint passes full entrance-to-exit navigation** (0/90
 for each standard final evaluation). See
 [`docs/NAVIGATION_REPAIR.md`](docs/NAVIGATION_REPAIR.md) for measured outcomes
 and the distinction between short curriculum successes and usable navigation.
+For the new workstation, start with [`HANDOFF_5090.md`](HANDOFF_5090.md): it covers
+the private data bundle, existing Isaac Sim/OceanSim installations, exact
+checkpoint paths, reproduction checks and bounded resume commands.
 
 This repository is a headless-first underwater robotics baseline for an RTX
 4060 8 GB workstation. The first task is a BlueROV2-like open-water PointNav
