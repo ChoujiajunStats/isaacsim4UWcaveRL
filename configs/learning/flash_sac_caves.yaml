@@ -1,0 +1,41 @@
+# Official FlashSAC algorithm; bounded, eager-mode compatibility pilot.
+# Upstream: Holiday-Robot/FlashSAC @ 87edc9061150ae9e962dd84e6544e27a1554b3ab
+# This is a feed-forward visual MLP, NOT the recurrent CNN+GRU PPO architecture.
+seed: 42
+normalize_reward: true
+normalized_G_max: 5.0
+asymmetric_observation: true
+device_type: cuda:0
+buffer_max_length: 32768
+buffer_min_length: 1024
+buffer_device_type: cuda:0
+sample_batch_size: 256
+learning_rate_init: 0.0003
+learning_rate_peak: 0.0003
+learning_rate_end: 0.00015
+learning_rate_warmup_rate: 0.0
+learning_rate_warmup_step: 0
+learning_rate_decay_rate: 1.0
+learning_rate_decay_step: 10000
+actor_num_blocks: 2
+actor_hidden_dim: 128
+actor_bc_alpha: 0.0
+actor_noise_zeta_mu: 2.0
+actor_noise_zeta_max: 16
+actor_update_period: 2
+critic_num_blocks: 2
+critic_hidden_dim: 256
+critic_num_bins: 101
+critic_min_v: -5.0
+critic_max_v: 5.0
+critic_target_update_tau: 0.01
+temp_initial_value: 0.01
+temp_target_sigma: 0.15
+temp_target_entropy: 0.0
+gamma: 0.995
+n_step: 1
+use_compile: false
+compile_mode: default
+use_amp: false
+load_optimizer: true
+load_reward_normalizer: true

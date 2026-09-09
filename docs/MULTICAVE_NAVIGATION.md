@@ -269,3 +269,23 @@ a mean travelled path of 5.86 m. Easy left the route bounds; medium and hard
 collided. The checkpoint is a training intermediate, not an accepted navigator.
 
 No converged checkpoint or held-out success result has been established.
+
+The subsequent 48-environment run
+`2026-09-08_23-41-19_multicave48_resume_stage1/model_607.pt` added 921,600
+transitions (300 PPO updates). Its balanced 90-episode true-entrance evaluation
+returned **0/90 successes**, 21/90 collisions and 69/90 out-of-bounds endings.
+Easy travelled an average 52.78 m, medium 20.57 m and hard 4.27 m. Its saved
+curriculum frontiers were 45.5625 / 45.5625 / 30.375 m, still short of the full
+63.49 / 113.85 / 133.31 m reference routes. All three latest ten-outcome
+promotion windows contained failures. The failed final acceptance gate is
+not a simulator crash or evidence that the trained navigator is ready.
+
+The seeded privileged route follower was also tested from those exact
+curriculum frontiers (`outputs/cave_assets/curriculum_607_route_following.json`).
+After 30 stationary steps with zero contacts, all three completed without
+collision or bounds violation. This establishes feasibility of those sampled
+spawns and onward paths, not general reliability of the learned policy.
+
+A separate [FlashSAC compatibility pilot](FLASHSAC_CAVE_PILOT.md) uses the same
+task but the native upstream feed-forward actor. It is not a matched recurrent
+algorithm comparison and does not replace the PPO baseline.

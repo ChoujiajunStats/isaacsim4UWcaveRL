@@ -118,6 +118,11 @@ class UnderwaterMultiCaveNavigationPPORunnerCfg(UnderwaterExplorePPORunnerCfg):
     max_iterations = 2000
     save_interval = 50
     experiment_name = "underwater_cave_multinav"
+    # Explicit fine-tuning controls. Defaults preserve normal checkpoint resume.
+    navigation_weights_only: bool = False
+    # Isaac Lab from_dict validates against the default's runtime type; a
+    # float sentinel permits Hydra overrides, unlike a None default.
+    navigation_reset_noise_std: float = 0.0
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,

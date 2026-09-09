@@ -50,7 +50,9 @@ from isaac_underwater.navigation import (
     robust_forward_clearance,
     visual_feature_dim,
 )
-from isaac_underwater.navigation.exit_curriculum import ExitDistanceCurriculum
+from isaac_underwater.navigation.exit_curriculum import (
+    ExitDistanceCurriculum, rehearsal_settings, sample_rehearsal_distances,
+)
 from isaac_underwater.navigation.route_geometry import project_polyline, sample_polyline
 from isaac_underwater.physics import (
     CurrentField,
@@ -142,6 +144,9 @@ class UnderwaterPointNavEnvCfg(DirectRLEnvCfg):
     light_control_channels = 0
     light_control_default_scale = 1.0
     visual_observation_enabled = False
+    # Avoid materializing per-robot Python/VIO packets in nominal GPU training.
+    # Disabled automatically for domain randomization and non-ground-truth localization.
+    batched_visual_observation_enabled = True
     visual_output_hw = (12, 16)
     visual_max_depth_m = 12.0
     visual_mission_command_enabled = True
@@ -193,6 +198,9 @@ class UnderwaterPointNavEnvCfg(DirectRLEnvCfg):
     navigation_curriculum_window = 10
     navigation_curriculum_success_threshold = 0.7
     navigation_curriculum_growth = 1.5
+    navigation_rehearsal_probability = 0.0
+    navigation_rehearsal_min_distance_m = 2.0
+    navigation_rehearsal_max_distance_m = 12.0
 
     position_scale = 0.1
     linear_velocity_scale = 0.5
@@ -845,12 +853,22 @@ class UnderwaterPointNavEnv(DirectRLEnv):
         if not getattr(self.cfg, "visual_observation_enabled", False):
             return {"policy": obs}
 
-        packets = self.build_sensor_packets()
         required = ("rgb_left", "rgb_right", "depth_left", "depth_right")
-        if any(any(getattr(packet, name) is None for name in required) for packet in packets):
-            raise RuntimeError("Visual observation requires synchronized stereo RGB/depth packets")
+        if (getattr(self.cfg, "batched_visual_observation_enabled", True)
+                and self._domain_gap_samples is None and source is PolicyStateSource.GROUND_TRUTH):
+            batch = self._build_sensor_batch()
+            if any(batch[name] is None for name in required):
+                raise RuntimeError("Visual observation requires synchronized stereo RGB/depth batches")
+            stack = batch.get
+        else:
+            packets = self.build_sensor_packets()
+            if any(any(getattr(packet, name) is None for name in required) for packet in packets):
+                raise RuntimeError("Visual observation requires synchronized stereo RGB/depth packets")
 
-        stack = lambda name: torch.stack([getattr(packet, name) for packet in packets], dim=0)
+            def stack(name):
+                if any(getattr(packet, name) is None for packet in packets):
+                    return None
+                return torch.stack([getattr(packet, name) for packet in packets], dim=0)
         mission_command = (
             obs[:, :4]
             if bool(getattr(self.cfg, "visual_mission_command_enabled", True))
@@ -861,12 +879,8 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             stack("rgb_right"),
             stack("depth_left"),
             stack("depth_right"),
-            imu_acceleration=None
-            if any(packet.imu_acceleration is None for packet in packets)
-            else stack("imu_acceleration"),
-            imu_angular_velocity=None
-            if any(packet.imu_angular_velocity is None for packet in packets)
-            else stack("imu_angular_velocity"),
+            imu_acceleration=stack("imu_acceleration"),
+            imu_angular_velocity=stack("imu_angular_velocity"),
             pressure_depth_m=stack("pressure_depth_m"),
             previous_action=self._actions,
             # The goal-conditioned pilot receives the first four navigation
@@ -1320,7 +1334,9 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             spawn_route_chainage = self._cave_scene_spawn_chainages[scene_ids].clone()
             tangent = self._cave_scene_spawn_tangents[scene_ids]
             if self._exit_curriculum is not None:
-                frontier = self._exit_curriculum.distance_m[scene_ids]
+                frontier = sample_rehearsal_distances(
+                    self._exit_curriculum.distance_m[scene_ids], **rehearsal_settings(self.cfg)
+                )
                 self._episode_curriculum_frontier_m[env_ids] = frontier
                 spawn_route_chainage = self._cave_scene_goal_chainages[scene_ids] - frontier
                 spawn, tangent = sample_polyline(
@@ -1462,8 +1478,8 @@ class UnderwaterPointNavEnv(DirectRLEnv):
             angular_velocity_w=self._robot.data.root_ang_vel_w,
         )
 
-    def build_sensor_packets(self, rewards: torch.Tensor | None = None) -> list[SensorPacket]:
-        """Return synchronized per-robot packets for perception/VIO adapters."""
+    def _build_sensor_batch(self) -> dict:
+        """Process sensor tensors once; packet metadata is optional downstream."""
         ground_truth = self._ground_truth_state()
         timestamp_s = ground_truth.timestamp_s
         rgb = depth = imu_acceleration = imu_angular_velocity = None
@@ -1579,6 +1595,23 @@ class UnderwaterPointNavEnv(DirectRLEnv):
                     depth_right = held
             if self._camera_left is not None:
                 rgb_left, depth_left = rgb, depth
+        return {
+            "ground_truth": ground_truth, "timestamp_s": timestamp_s,
+            "rgb": rgb, "depth": depth, "rgb_left": rgb_left, "rgb_right": rgb_right,
+            "depth_left": depth_left, "depth_right": depth_right,
+            "imu_acceleration": imu_acceleration, "imu_angular_velocity": imu_angular_velocity,
+            "pressure_depth_m": pressure_depth, "jitter": jitter, "frame_dropped": frame_dropped,
+        }
+
+    def build_sensor_packets(self, rewards: torch.Tensor | None = None) -> list[SensorPacket]:
+        """Return synchronized per-robot packets for perception/VIO adapters."""
+        batch = self._build_sensor_batch()
+        ground_truth, timestamp_s = batch["ground_truth"], batch["timestamp_s"]
+        rgb, depth = batch["rgb"], batch["depth"]
+        rgb_left, rgb_right = batch["rgb_left"], batch["rgb_right"]
+        depth_left, depth_right = batch["depth_left"], batch["depth_right"]
+        imu_acceleration, imu_angular_velocity = batch["imu_acceleration"], batch["imu_angular_velocity"]
+        pressure_depth, jitter, frame_dropped = batch["pressure_depth_m"], batch["jitter"], batch["frame_dropped"]
         packets = []
         for robot_index in range(self.num_envs):
             packet_timestamp = timestamp_s + float(jitter[robot_index].item())

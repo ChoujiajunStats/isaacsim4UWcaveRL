@@ -20,6 +20,8 @@ from isaac_underwater.navigation.exit_curriculum import ExitDistanceCurriculum
 class FakePolicy(torch.nn.Linear):
     def __init__(self):
         super().__init__(2, 2)
+        self.std = torch.nn.Parameter(torch.ones(2))
+        self.noise_std_type = "scalar"
         self.resets = 0
 
     def reset(self):
@@ -51,6 +53,63 @@ def make_runner(**kwargs):
 
 
 class NavigationCheckpointTest(unittest.TestCase):
+    def test_noise_reset_only_for_explicit_warm_start(self):
+        with TemporaryDirectory(prefix="navigation-checkpoint-") as directory:
+            path = str(Path(directory) / "model.pt")
+            make_runner().save(path)
+            target = make_runner()
+            target.cfg = {"navigation_weights_only": True, "navigation_reset_noise_std": .4}
+            target.load(path, map_location="cpu")
+            torch.testing.assert_close(target.alg.policy.std, torch.full((2,), .4))
+            for settings in ({"navigation_reset_noise_std": .4},
+                             {"navigation_weights_only": True, "navigation_reset_noise_std": -.1},
+                             {"navigation_weights_only": True, "navigation_reset_noise_std": float("nan")}):
+                target.cfg = settings
+                with self.subTest(settings=settings), self.assertRaises(ValueError):
+                    target.load(path, map_location="cpu")
+
+    def test_zero_noise_reset_sentinel_preserves_normal_resume(self):
+        with TemporaryDirectory(prefix="navigation-checkpoint-") as directory:
+            path = str(Path(directory) / "model.pt")
+            make_runner().save(path)
+            target = make_runner()
+            target.cfg = {"navigation_weights_only": False, "navigation_reset_noise_std": 0.0}
+            target.load(path, map_location="cpu")
+            torch.testing.assert_close(target.alg.policy.std, torch.ones(2))
+            self.assertEqual(target.current_learning_iteration, 17)
+
+    def test_explicit_warm_start_resets_optimization_and_curriculum(self):
+        with TemporaryDirectory(prefix="navigation-checkpoint-") as directory:
+            path = str(Path(directory) / "model.pt")
+            source = make_runner()
+            source.env._exit_curriculum.distance_m.fill_(8.)
+            source.alg.policy(torch.ones(1, 2)).sum().backward()
+            source.alg.optimizer.step()
+            self.assertTrue(source.alg.optimizer.state)
+            source.alg.optimizer.param_groups[0]["lr"] = .02
+            source.save(path)
+            target = make_runner()
+            target.cfg = {"navigation_weights_only": True}
+            target.load(path, map_location="cpu")
+            self.assertEqual(target.current_learning_iteration, 0)
+            self.assertFalse(target.alg.optimizer.state)
+            self.assertEqual(target.alg.optimizer.param_groups[0]["lr"], .001)
+            torch.testing.assert_close(target.env._exit_curriculum.distance_m, torch.tensor([4., 4.]))
+            for key, value in source.alg.policy.state_dict().items():
+                torch.testing.assert_close(target.alg.policy.state_dict()[key], value)
+            target.save(str(Path(directory) / "warm.pt"))
+            saved = torch.load(Path(directory) / "warm.pt", weights_only=False)
+            self.assertEqual(saved["infos"]["navigation_training"]["warm_start"]["checkpoint"], path)
+
+    def test_rehearsal_resume_mismatch_requires_explicit_warm_start(self):
+        with TemporaryDirectory(prefix="navigation-checkpoint-") as directory:
+            path = str(Path(directory) / "model.pt")
+            make_runner().save(path)
+            target = make_runner()
+            target.env.cfg = SimpleNamespace(navigation_rehearsal_probability=.5)
+            with self.assertRaisesRegex(ValueError, "rehearsal config mismatch"):
+                target.load(path, map_location="cpu")
+
     def test_curriculum_starts_real_episodes_without_artificial_timeout_failures(self):
         for enabled in (True, False):
             with self.subTest(enabled=enabled), patch.object(OnPolicyRunner, "learn") as learn:

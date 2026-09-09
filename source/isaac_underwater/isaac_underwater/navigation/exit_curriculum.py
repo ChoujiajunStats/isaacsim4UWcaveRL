@@ -6,6 +6,33 @@ import math
 import torch
 
 
+def rehearsal_settings(cfg) -> dict:
+    """Checkpointable stateless spawn settings, backward-compatible defaults."""
+    return {
+        "probability": float(getattr(cfg, "navigation_rehearsal_probability", 0.0)),
+        "min_distance_m": float(getattr(cfg, "navigation_rehearsal_min_distance_m", 2.0)),
+        "max_distance_m": float(getattr(cfg, "navigation_rehearsal_max_distance_m", 12.0)),
+    }
+
+
+def sample_rehearsal_distances(frontiers: torch.Tensor, *, probability: float,
+                               min_distance_m: float, max_distance_m: float) -> torch.Tensor:
+    """Mix frontier starts with easier exit suffixes; never exceed the frontier.
+
+    Return the *actual* sampled distance to record(), so rehearsal successes
+    cannot promote a harder frontier. Probability zero preserves RNG exactly.
+    """
+    if (not all(math.isfinite(v) for v in (probability, min_distance_m, max_distance_m))
+            or not 0 <= probability <= 1 or not 0 < min_distance_m <= max_distance_m):
+        raise ValueError("Invalid navigation rehearsal probability/distance range")
+    if probability == 0:
+        return frontiers
+    upper = frontiers.clamp(max=max_distance_m)
+    lower = upper.clamp(max=min_distance_m)
+    sampled = lower + torch.rand_like(frontiers) * (upper - lower)
+    return torch.where(torch.rand_like(frontiers) < probability, sampled, frontiers)
+
+
 class ExitDistanceCurriculum:
     """Increase remaining route distance after a window of successful exits.
 

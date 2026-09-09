@@ -14,6 +14,9 @@ parser.add_argument("--profile", default="train_all")
 parser.add_argument("--episode_length_s", type=float, default=300.0)
 parser.add_argument("--lookahead_m", type=float, default=0.8)
 parser.add_argument("--speed_mps", type=float, default=1.2)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--curriculum_checkpoint", type=Path, default=None)
+parser.add_argument("--spawn_hold_steps", type=int, default=0)
 parser.add_argument("--output", type=Path, default=Path("outputs/cave_assets/route_following.json"))
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -34,9 +37,9 @@ from isaaclab_tasks.utils import parse_env_cfg
 def main() -> None:
     cfg = parse_env_cfg("Isaac-Underwater-Cave-Navigation-v0", device=args.device)
     cfg.scene.num_envs = len(cfg.world.scene_variants)
-    cfg.seed = 42
+    cfg.seed = args.seed
     cfg.episode_length_s = args.episode_length_s
-    cfg.navigation_curriculum_enabled = False
+    cfg.navigation_curriculum_enabled = args.curriculum_checkpoint is not None
     cfg.domain_randomization_enabled = False
     cfg.camera_sensor = cfg.camera_left_sensor = cfg.camera_right_sensor = cfg.imu_sensor = None
     cfg.visual_observation_enabled = False
@@ -49,6 +52,20 @@ def main() -> None:
     try:
         task = env.unwrapped
         env.reset()
+        if args.curriculum_checkpoint is not None:
+            checkpoint = torch.load(args.curriculum_checkpoint, map_location=task.device, weights_only=False)
+            training_state = checkpoint["infos"]["navigation_training"]
+            assert training_state["scene_keys"] == [scene.key for scene in cfg.world.scene_variants]
+            task._exit_curriculum.load_state_dict(training_state["exit_curriculum"])
+            env.reset()
+        initial_frontiers = task._episode_route_reference_m.tolist()
+        hold_peak_contact = torch.zeros(task.num_envs, device=task.device)
+        with torch.inference_mode():
+            for _ in range(args.spawn_hold_steps):
+                _, _, terminated, truncated, _ = env.step(torch.zeros(task.num_envs, 6, device=task.device))
+                hold_peak_contact = torch.maximum(hold_peak_contact, task._cave_contact_force_n)
+                assert not torch.any(terminated | truncated), "Stationary curriculum spawn terminated"
+        print(f"route_oracle: stationary_spawn_contact_n={hold_peak_contact.tolist()}", flush=True)
         scene_ids = task._cave_scene_ids
         points = task._multi_cave_centerlines[scene_ids]
         chainages = task._multi_cave_chainages[scene_ids]
@@ -94,6 +111,12 @@ def main() -> None:
         report = {
             "controller": "privileged_reference_path_follower_not_PPO",
             "profile": args.profile,
+            "seed": args.seed,
+            "navigation_curriculum": args.curriculum_checkpoint is not None,
+            "curriculum_checkpoint": str(args.curriculum_checkpoint) if args.curriculum_checkpoint else None,
+            "initial_remaining_route_m": initial_frontiers,
+            "spawn_hold_steps": args.spawn_hold_steps,
+            "stationary_peak_contact_n": hold_peak_contact.tolist(),
             "episode_length_s": args.episode_length_s,
             "lookahead_m": args.lookahead_m,
             "command_speed_mps": args.speed_mps,
